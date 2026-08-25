@@ -1,0 +1,40 @@
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: reliability-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  grafana:
+    image: grafana/grafana:latest
+    container_name: reliability-grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  postgres:
+    image: postgres:16
+    container_name: ops-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: reliability_agent
+      POSTGRES_USER: reliability_user
+      POSTGRES_PASSWORD: reliability_password
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reliability_user -d reliability_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

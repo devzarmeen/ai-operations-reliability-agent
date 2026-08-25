@@ -1,0 +1,33 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Zarmeen"}
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi (>=0.141.1,<0.142.0)",
+    "uvicorn (>=0.52.4,<0.53.0)",
+    "sqlmodel (>=0.0.39,<0.0.40)",
+    "psycopg (>=3.3.4,<4.0.0)",
+    "pydantic-settings (>=2.15.0,<3.0.0)",
+    "python-dotenv (>=1.2.3,<2.0.0)",
+    "httpx (>=0.28.1,<0.29.0)",
+    "openai-agents (>=0.22.0,<0.23.0)",
+    "groq (>=1.6.0,<2.0.0)",
+    "apscheduler (>=3.11.3,<4.0.0)"
+]
+
+[tool.poetry]
+package-mode = false
+[build-system]
+
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.1.1,<10.0.0)",
+    "pytest-asyncio (>=1.4.0,<2.0.0)"
+]
