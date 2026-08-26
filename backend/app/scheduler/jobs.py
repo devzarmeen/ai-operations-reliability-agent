@@ -103,7 +103,8 @@ Do not say UNKNOWN when the supplied evidence is sufficient.
         session.add(incident)
         session.commit()
         session.refresh(incident)
-        handle_incident_alert(incident)
+        
+        await handle_incident_alert(incident)
 
         print(
             f"[SCHEDULER] Incident #{incident.id} created: "

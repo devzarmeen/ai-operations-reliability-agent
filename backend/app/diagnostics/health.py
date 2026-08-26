@@ -14,12 +14,21 @@ async def service_health(
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(health_url)
 
+        response_data = response.json()
+
+        api_status = response_data.get("status", "").lower()
+
+        is_healthy = (
+            response.status_code == 200
+            and api_status == "healthy"
+        )
+
         return {
             "service": service_name,
             "url": health_url,
             "status_code": response.status_code,
-            "healthy": response.status_code == 200,
-            "response": response.json(),
+            "healthy": is_healthy,
+            "response": response_data,
         }
 
     except httpx.RequestError as exc:

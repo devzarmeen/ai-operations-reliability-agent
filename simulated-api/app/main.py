@@ -5,7 +5,7 @@ from app.models import OperationEvent
 
 app = FastAPI(
     title="Operations Reliability Agent - Simulated API",
-    version="1.0.0"
+    version="1.0.0",
 )
 
 
@@ -13,7 +13,7 @@ app = FastAPI(
 def health():
     return {
         "status": "healthy",
-        "service": "simulated-api-service"
+        "service": "simulated-api-service",
     }
 
 
@@ -21,5 +21,5 @@ def health():
 def create_event(event: OperationEvent):
     return {
         "status": "received",
-        "event": event
+        "event": event,
     }
