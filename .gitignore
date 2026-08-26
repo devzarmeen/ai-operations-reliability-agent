@@ -1,14 +1,104 @@
+# =========================
+# Environment / Secrets
+# =========================
 .env
+.env.*
+!.env.example
+
 backend/.env
+backend/.env.*
 agent/.env
-.env.example
+agent/.env.*
+
+# API keys / credentials
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+credentials.json
+secrets.json
+service-account*.json
+
+# =========================
+# Backups
+# =========================
+backups/
+*.sql
+*.dump
+*.backup
+*.bak
+*.tar
+*.tar.gz
+*.zip
+
+# =========================
+# Python
+# =========================
 __pycache__/
+*.py[cod]
+*.pyo
 .pytest_cache/
 .mypy_cache/
-.vscode/
-.idea
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
+venv/
+env/
+
+# =========================
+# Node
+# =========================
 node_modules/
 dist/
-.DS_Store
+build/
+.npm/
+.cache/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# Logs
+# =========================
 *.log
+logs/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# =========================
+# Local databases
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# Grafana / Prometheus local data
+# =========================
+grafana-backup.tar.gz
+prometheus-backup.tar.gz
+
+# =========================
+# Local Docker data
+# =========================
+docker-data/

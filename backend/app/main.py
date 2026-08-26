@@ -2,6 +2,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from fastapi.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from app.api.agent import router as agent_router
 from app.api.incidents import router as incidents_router
 from app.core.database import create_db_and_tables
@@ -62,3 +64,9 @@ def database_health():
         "database": "connected",
         "result": result,
     }
+@app.get("/metrics")
+def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )

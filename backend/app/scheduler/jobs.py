@@ -11,7 +11,7 @@ from app.diagnostics.errors import error_rate
 from app.diagnostics.latency import latency
 from app.models.incident import Incident
 from app.alerts.manager import handle_incident_alert
-
+from app.metrics import update_reliability_metrics
 
 async def run_reliability_check():
     """
@@ -116,7 +116,48 @@ Do not say UNKNOWN when the supplied evidence is sufficient.
         session.commit()
         session.refresh(incident)
 
-    # 8. Alert only when state changes
+    # 8. Update Prometheus metrics
+    with Session(engine) as session:
+        incidents = session.exec(
+            select(Incident)
+        ).all()
+
+    update_reliability_metrics(
+        total=len(incidents),
+        healthy=sum(
+            1 for item in incidents
+            if item.status == "HEALTHY"
+        ),
+        degraded=sum(
+            1 for item in incidents
+            if item.status == "DEGRADED"
+        ),
+        down=sum(
+            1 for item in incidents
+            if item.status == "DOWN"
+        ),
+        low=sum(
+            1 for item in incidents
+            if item.severity == "LOW"
+        ),
+        medium=sum(
+            1 for item in incidents
+            if item.severity == "MEDIUM"
+        ),
+        high=sum(
+            1 for item in incidents
+            if item.severity == "HIGH"
+        ),
+        critical=sum(
+            1 for item in incidents
+            if item.severity == "CRITICAL"
+        ),
+        request_rate=metrics.get("value"),
+        error_rate=errors.get("error_rate"),
+        p95_latency=latency_result.get("value"),
+        service_healthy=health.get("healthy", False),
+    )
+    # 9. Alert only when state changes
     state_changed = (
         previous_incident is None
         or previous_incident.status != incident.status
