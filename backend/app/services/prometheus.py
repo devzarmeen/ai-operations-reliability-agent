@@ -17,14 +17,19 @@ class PrometheusQueryError(Exception):
 def _scalar(
     result: list[dict[str, Any]],
 ) -> float | None:
+    """
+    Extract the first numeric value from a Prometheus vector result.
+
+    Prometheus instant-vector values normally look like:
+        ["timestamp", "value"]
+    """
 
     if not result:
         return None
 
     try:
-        value = float(
-            result[0]["value"][1]
-        )
+        raw_value = result[0]["value"][1]
+        value = float(raw_value)
     except (
         KeyError,
         IndexError,
@@ -40,16 +45,15 @@ def _scalar(
 
 
 class PrometheusService:
+    """Small async client for the Prometheus HTTP API."""
 
     def __init__(
         self,
         base_url: str | None = None,
         timeout: float = 8.0,
     ) -> None:
-
         self.base_url = (
-            base_url
-            or settings.prometheus_url
+            base_url or settings.prometheus_url
         ).rstrip("/")
 
         self.timeout = timeout
@@ -58,11 +62,9 @@ class PrometheusService:
         self,
         promql: str,
     ) -> dict[str, Any]:
+        """Execute an instant PromQL query."""
 
-        url = (
-            f"{self.base_url}"
-            "/api/v1/query"
-        )
+        url = f"{self.base_url}/api/v1/query"
 
         try:
             async with httpx.AsyncClient(
@@ -94,6 +96,16 @@ class PrometheusService:
                     f"request_failed: {exc}"
                     f" | url={url}"
                 ),
+            }
+
+        except Exception as exc:
+            return {
+                "ok": False,
+                "query": promql,
+                "result_type": None,
+                "result": [],
+                "value": None,
+                "error": str(exc),
             }
 
         if response.status_code != 200:
@@ -136,17 +148,12 @@ class PrometheusService:
 
         data = payload.get("data") or {}
 
-        result = (
-            data.get("result")
-            or []
-        )
+        result = data.get("result") or []
 
         return {
             "ok": True,
             "query": promql,
-            "result_type": data.get(
-                "resultType"
-            ),
+            "result_type": data.get("resultType"),
             "result": result,
             "value": _scalar(result),
             "error": None,
@@ -156,10 +163,11 @@ class PrometheusService:
         self,
         promql: str,
     ) -> dict[str, Any]:
+        """
+        Execute a PromQL query and return its first numeric value.
+        """
 
-        response = await self.query(
-            promql
-        )
+        response = await self.query(promql)
 
         return {
             "ok": response["ok"],

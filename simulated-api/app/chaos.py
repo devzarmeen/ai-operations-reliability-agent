@@ -1,831 +1,266 @@
-import sys
-import time
-from pathlib import Path
+from datetime import datetime, timezone
 
-import requests
-
-
-ROOT = Path(__file__).resolve().parents[1]
-
-sys.path.insert(
-    0,
-    str(ROOT / "backend"),
-)
-
-from scenarios import SCENARIOS
-from app.safety.enforcement import requires_approval
-
-
-SIMULATED_API_URL = "http://127.0.0.1:8001"
-BACKEND_API_URL = "http://127.0.0.1:9000"
+from app.state import state
 
 
 # ============================================================
-# Evaluation scenario -> simulated-api chaos scenario
+# Supported chaos scenarios
 # ============================================================
 
-SCENARIO_MAP = {
-    "normal_operation": "normal",
-    "high_error_rate": "high_error_rate",
-    "service_unavailable": "service_unavailable",
-    "bad_deployment": "recent_bad_deployment",
-    "container_restart_loop": "container_restart_loop",
-    "database_unavailable": "database_unavailable",
-    "traffic_spike": "traffic_spike",
-    "latency_degradation": "high_latency",
-    "client_error_spike": "http_400_spike",
-    "combined_failure": "combined_failure",
+SCENARIOS = {
+    "normal",
+    "high_error_rate",
+    "service_unavailable",
+    "recent_bad_deployment",
+    "container_restart_loop",
+    "database_unavailable",
+    "traffic_spike",
+    "high_latency",
+    "http_400_spike",
+    "combined_failure",
 }
 
 
 # ============================================================
-# HTTP helpers
+# Reset scenario
 # ============================================================
 
-def reset_simulated_api() -> None:
-    response = requests.post(
-        f"{SIMULATED_API_URL}/chaos/reset",
-        timeout=5,
-    )
+def reset_scenario() -> dict:
+    with state.lock:
+        state.scenario = "normal"
+        state.version = "1.0.0"
+        state.deployed_at = datetime.now(
+            timezone.utc
+        ).isoformat()
 
-    response.raise_for_status()
+        state.restart_count = 0
+        state.container_state = "running"
+        state.container_health = "healthy"
+        state.replicas = 1
+
+        state.db_available = True
+        state.db_latency_ms = 3.0
+        state.db_connection_errors = 0
+
+        state.resource_pressure = False
+
+        state.history = [
+            {
+                "version": "1.0.0",
+                "deployed_at": state.deployed_at,
+                "bad": False,
+            }
+        ]
+
+        state.logs.clear()
+
+    return state.snapshot()
 
 
-def apply_chaos(scenario_name: str) -> dict:
-    """
-    Translate evaluation scenario name into the actual
-    simulated-api scenario name and apply it.
-    """
+# ============================================================
+# Apply chaos scenario
+# ============================================================
 
-    sim_scenario = SCENARIO_MAP.get(
-        scenario_name,
-        scenario_name,
-    )
-
-    print(
-        f"  Evaluation scenario: {scenario_name}"
-    )
-
-    print(
-        f"  Simulated API scenario: {sim_scenario}"
-    )
-
-    response = requests.post(
-        f"{SIMULATED_API_URL}/chaos/scenario",
-        json={
-            "name": sim_scenario,
-        },
-        timeout=5,
-    )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            "Chaos injection failed for "
-            f"{scenario_name}: "
-            f"{response.text}"
+def apply_scenario(name: str) -> dict:
+    if name not in SCENARIOS:
+        raise ValueError(
+            f"Unknown chaos scenario: {name}"
         )
 
-    return response.json()
+    # Always start from a clean baseline.
+    reset_scenario()
 
+    log_message = None
 
-def send_traffic() -> None:
-    """
-    Generate metric data points by calling simulated-api.
-    """
+    with state.lock:
+        state.scenario = name
 
-    for _ in range(30):
-        try:
-            requests.post(
-                f"{SIMULATED_API_URL}/events",
-                json={
-                    "event_id": (
-                        f"eval-{time.time_ns()}"
-                    ),
-                    "timestamp": (
-                        time.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ",
-                            time.gmtime(),
-                        )
-                    ),
-                    "service": (
-                        "simulated-api-service"
-                    ),
-                    "operation": "create_event",
-                    "status": "success",
-                    "latency_ms": 15.0,
-                },
-                timeout=1,
-            )
+        # ----------------------------------------------------
+        # Normal
+        # ----------------------------------------------------
 
-            requests.get(
-                f"{SIMULATED_API_URL}/health",
-                timeout=1,
-            )
-
-        except requests.RequestException:
-            # The scenario may intentionally make the
-            # service unhealthy.
+        if name == "normal":
             pass
 
+        # ----------------------------------------------------
+        # High 5xx error rate
+        # ----------------------------------------------------
 
-# ============================================================
-# Live scenario execution
-# ============================================================
+        elif name == "high_error_rate":
+            log_message = "Injected elevated 5xx rate"
 
-def run_live_scenario(
-    scenario: dict,
-) -> dict:
+        # ----------------------------------------------------
+        # Service unavailable
+        # ----------------------------------------------------
 
-    name = scenario["name"]
+        elif name == "service_unavailable":
+            state.container_state = "running"
+            state.container_health = "healthy"
 
-    alert = scenario["alert"]
+        # ----------------------------------------------------
+        # Bad deployment
+        # ----------------------------------------------------
 
-    expected_cause = scenario[
-        "expected_cause"
-    ]
+        elif name == "recent_bad_deployment":
+            state.version = "1.1.0-bad"
 
-    expected_action = scenario[
-        "expected_action"
-    ]
+            state.deployed_at = datetime.now(
+                timezone.utc
+            ).isoformat()
 
-    print(
-        f"\n--- Running Live Scenario: {name} ---"
-    )
-
-    # --------------------------------------------------------
-    # 1. Reset simulated API
-    # --------------------------------------------------------
-
-    try:
-        reset_simulated_api()
-
-    except Exception as exc:
-        return {
-            "name": name,
-            "ok": False,
-            "reason": (
-                f"reset_failed: {exc}"
-            ),
-        }
-
-    print(
-        "  Waiting 30s for old metrics "
-        "to age out..."
-    )
-
-    time.sleep(30)
-
-    # --------------------------------------------------------
-    # 2. Apply chaos
-    # --------------------------------------------------------
-
-    # Healthy baseline scenario should remain normal.
-    if name == "normal_operation":
-        print(
-            "  Healthy baseline: no chaos injected."
-        )
-
-    else:
-        try:
-            chaos_result = apply_chaos(name)
-
-            print(
-                "  Chaos applied successfully: "
-                f"{chaos_result.get('scenario')}"
-            )
-
-        except Exception as exc:
-            print(
-                f"  [ERROR] {exc}"
-            )
-
-            return {
-                "name": name,
-                "ok": False,
-                "reason": (
-                    f"chaos_injection_failed: {exc}"
-                ),
-            }
-
-    # --------------------------------------------------------
-    # 3. Generate traffic
-    # --------------------------------------------------------
-
-    send_traffic()
-
-    print(
-        "  Waiting 6s for Prometheus scrape..."
-    )
-
-    time.sleep(6)
-
-    # --------------------------------------------------------
-    # 4. Trigger backend alert ingestion
-    # --------------------------------------------------------
-
-    webhook_payload = {
-        "status": "firing",
-        "alerts": [
-            {
-                "status": "firing",
-                "labels": {
-                    "alertname": alert[
-                        "alert_name"
-                    ],
-                    "service": (
-                        "simulated-api-service"
-                    ),
-                    "severity": alert.get(
-                        "severity",
-                        "HIGH",
-                    ),
-                },
-                "annotations": {
-                    "summary": (
-                        alert.get("summary")
-                        or alert.get("description")
-                        or ""
-                    ),
-                },
-                "fingerprint": (
-                    f"eval-{name}-"
-                    f"{int(time.time() * 1000)}"
-                ),
-            }
-        ],
-    }
-
-    try:
-        response = requests.post(
-            f"{BACKEND_API_URL}/api/alerts/webhook",
-            json=webhook_payload,
-            timeout=10,
-        )
-
-    except requests.RequestException as exc:
-        return {
-            "name": name,
-            "ok": False,
-            "reason": (
-                f"webhook_request_failed: {exc}"
-            ),
-        }
-
-    if response.status_code != 200:
-        print(
-            "  [ERROR] Alert webhook failed: "
-            f"{response.text}"
-        )
-
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "webhook_failed",
-        }
-
-    webhook_res = response.json()
-
-    ingested = webhook_res.get(
-        "ingested",
-        [],
-    )
-
-    if not ingested:
-        print(
-            "  [ERROR] Alert was not ingested: "
-            f"{webhook_res}"
-        )
-
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "alert_skipped",
-        }
-
-    investigation_id = ingested[0].get(
-        "investigation_id"
-    )
-
-    if not investigation_id:
-        print(
-            "  [ERROR] Webhook did not create "
-            "an investigation."
-        )
-
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "no_investigation_id",
-        }
-
-    print(
-        f"  Investigation ID: {investigation_id}"
-    )
-
-    # --------------------------------------------------------
-    # 5. Fetch investigation
-    # --------------------------------------------------------
-
-    try:
-        response = requests.get(
-            f"{BACKEND_API_URL}/api/investigations/"
-            f"{investigation_id}",
-            timeout=5,
-        )
-
-    except requests.RequestException as exc:
-        return {
-            "name": name,
-            "ok": False,
-            "reason": (
-                f"fetch_investigation_failed: {exc}"
-            ),
-        }
-
-    if response.status_code != 200:
-        print(
-            "  [ERROR] Fetching investigation failed: "
-            f"{response.text}"
-        )
-
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "fetch_investigation_failed",
-        }
-
-    payload = response.json()
-
-    investigation = payload[
-        "investigation"
-    ]
-
-    actual_cause = investigation[
-        "likely_cause"
-    ]
-
-    actual_action = investigation[
-        "recommended_action_type"
-    ]
-
-    approval_required = investigation[
-        "approval_required"
-    ]
-
-    approval_status = investigation[
-        "approval_status"
-    ]
-
-    # --------------------------------------------------------
-    # 6. Validate diagnosis
-    # --------------------------------------------------------
-
-    cause_correct = (
-        actual_cause
-        == expected_cause
-    )
-
-    action_correct = (
-        actual_action
-        == expected_action
-    )
-
-    expected_approval = requires_approval(
-        actual_action
-    )
-
-    approval_correct = (
-        approval_required
-        == expected_approval
-    )
-
-    print(
-        "  Diagnosis: "
-        f"{actual_cause} "
-        f"(Expected: {expected_cause}) "
-        f"-> "
-        f"{'OK' if cause_correct else 'FAIL'}"
-    )
-
-    print(
-        "  Action: "
-        f"{actual_action} "
-        f"(Expected: {expected_action}) "
-        f"-> "
-        f"{'OK' if action_correct else 'FAIL'}"
-    )
-
-    print(
-        "  Approval Required: "
-        f"{approval_required} "
-        f"(Expected: {expected_approval}) "
-        f"-> "
-        f"{'OK' if approval_correct else 'FAIL'}"
-    )
-
-    # --------------------------------------------------------
-    # 7. Recovery
-    # --------------------------------------------------------
-
-    recovery_ok = None
-    recovery_verified = None
-
-    # High-impact action
-    if approval_required:
-
-        if approval_status != "pending":
-            print(
-                "  [ERROR] Expected pending approval, "
-                f"got {approval_status}"
-            )
-
-            return {
-                "name": name,
-                "ok": False,
-                "reason": (
-                    "not_pending_approval"
-                ),
-                "diagnosis_correct": cause_correct,
-                "recommendation_correct": action_correct,
-                "approval_policy_compliant": (
-                    approval_correct
-                ),
-            }
-
-        print(
-            f"  Approving action {actual_action}..."
-        )
-
-        approve_body = {
-            "operator": "live-eval-bot",
-            "note": (
-                "Automatic approval for live "
-                f"evaluation of {name}"
-            ),
-        }
-
-        try:
-            response = requests.post(
-                f"{BACKEND_API_URL}/api/investigations/"
-                f"{investigation_id}/approve",
-                json=approve_body,
-                timeout=10,
-            )
-
-        except requests.RequestException as exc:
-            return {
-                "name": name,
-                "ok": False,
-                "reason": (
-                    f"approval_request_failed: {exc}"
-                ),
-                "diagnosis_correct": (
-                    cause_correct
-                ),
-                "recommendation_correct": (
-                    action_correct
-                ),
-                "approval_policy_compliant": (
-                    approval_correct
-                ),
-            }
-
-        if response.status_code != 200:
-            print(
-                "  [ERROR] Action approval failed: "
-                f"{response.text}"
-            )
-
-            return {
-                "name": name,
-                "ok": False,
-                "reason": "approval_post_failed",
-                "diagnosis_correct": (
-                    cause_correct
-                ),
-                "recommendation_correct": (
-                    action_correct
-                ),
-                "approval_policy_compliant": (
-                    approval_correct
-                ),
-            }
-
-        approve_res = response.json()
-
-        updated_inv = (
-            approve_res.get(
-                "investigation"
-            )
-            or {}
-        )
-
-        recovery_ok = (
-            updated_inv.get("status")
-            == "RECOVERED"
-        )
-
-        recoveries = approve_res.get(
-            "recoveries",
-            [],
-        )
-
-        recovery_verified = (
-            len(recoveries) > 0
-            and recoveries[0].get(
-                "recovered"
-            ) is True
-        )
-
-        print(
-            "  Recovery Success: "
-            f"{recovery_ok} -> "
-            f"{'OK' if recovery_ok else 'FAIL'}"
-        )
-
-        print(
-            "  Recovery Verified: "
-            f"{recovery_verified} -> "
-            f"{'OK' if recovery_verified else 'FAIL'}"
-        )
-
-    # Non-impact action
-    elif expected_action in {
-        "observe",
-        "escalate",
-    }:
-
-        recovery_ok = True
-        recovery_verified = True
-
-    # --------------------------------------------------------
-    # 8. Final scenario result
-    # --------------------------------------------------------
-
-    ok = (
-        cause_correct
-        and action_correct
-        and approval_correct
-        and recovery_ok is not False
-    )
-
-    return {
-        "name": name,
-        "ok": ok,
-        "diagnosis_correct": cause_correct,
-        "recommendation_correct": action_correct,
-        "approval_policy_compliant": (
-            approval_correct
-        ),
-        "recovery_success": recovery_ok,
-        "recovery_verified": recovery_verified,
-        "actual_cause": actual_cause,
-        "actual_action": actual_action,
-    }
-
-
-# ============================================================
-# Main evaluation
-# ============================================================
-
-def main():
-
-    print(
-        "Starting Live Integration Evaluation..."
-    )
-
-    print(
-        f"Target simulated-api: "
-        f"{SIMULATED_API_URL}"
-    )
-
-    print(
-        f"Target backend-api: "
-        f"{BACKEND_API_URL}"
-    )
-
-    print(
-        f"Scenarios: {len(SCENARIOS)}"
-    )
-
-    results = []
-
-    for scenario in SCENARIOS:
-
-        try:
-            result = run_live_scenario(
-                scenario
-            )
-
-            results.append(result)
-
-        except Exception as exc:
-
-            print(
-                f"  [CRITICAL ERROR] "
-                f"Scenario {scenario['name']} "
-                f"crashed: {exc}"
-            )
-
-            results.append(
+            state.history.append(
                 {
-                    "name": scenario["name"],
-                    "ok": False,
-                    "reason": (
-                        f"exception: {exc}"
-                    ),
-                    "diagnosis_correct": False,
-                    "recommendation_correct": False,
-                    "approval_policy_compliant": False,
-                    "recovery_success": False,
-                    "recovery_verified": False,
+                    "version": "1.1.0-bad",
+                    "deployed_at": state.deployed_at,
+                    "bad": True,
                 }
             )
 
-    # --------------------------------------------------------
-    # Final reset
-    # --------------------------------------------------------
-
-    try:
-        reset_simulated_api()
-
-    except Exception as exc:
-        print(
-            f"[WARNING] Final reset failed: {exc}"
-        )
-
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
-
-    print(
-        "\n"
-        + "=" * 60
-    )
-
-    print(
-        "LIVE EVALUATION SUMMARY"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    total = len(results)
-
-    passed = sum(
-        1
-        for result in results
-        if result.get("ok")
-    )
-
-    diag_correct = sum(
-        1
-        for result in results
-        if result.get(
-            "diagnosis_correct"
-        )
-    )
-
-    rec_correct = sum(
-        1
-        for result in results
-        if result.get(
-            "recommendation_correct"
-        )
-    )
-
-    policy_compliant = sum(
-        1
-        for result in results
-        if result.get(
-            "approval_policy_compliant"
-        )
-    )
-
-    recovery_attempts = sum(
-        1
-        for result in results
-        if result.get(
-            "recovery_success"
-        ) is not None
-    )
-
-    recovery_successes = sum(
-        1
-        for result in results
-        if result.get(
-            "recovery_success"
-        ) is True
-    )
-
-    recovery_verifications = sum(
-        1
-        for result in results
-        if result.get(
-            "recovery_verified"
-        ) is True
-    )
-
-    print(
-        f"Total Scenarios: "
-        f"{total}"
-    )
-
-    if total > 0:
-
-        print(
-            f"Passed Scenarios: "
-            f"{passed} / {total} "
-            f"({passed / total * 100:.1f}%)"
-        )
-
-        print(
-            f"Diagnosis Accuracy: "
-            f"{diag_correct} / {total} "
-            f"({diag_correct / total * 100:.1f}%)"
-        )
-
-        print(
-            f"Recommendation Accuracy: "
-            f"{rec_correct} / {total} "
-            f"({rec_correct / total * 100:.1f}%)"
-        )
-
-        print(
-            f"Approval Policy Compliance: "
-            f"{policy_compliant} / {total} "
-            f"({policy_compliant / total * 100:.1f}%)"
-        )
-
-    if recovery_attempts > 0:
-
-        print(
-            f"Recovery Success Rate: "
-            f"{recovery_successes} / "
-            f"{recovery_attempts} "
-            f"({recovery_successes / recovery_attempts * 100:.1f}%)"
-        )
-
-        print(
-            f"Recovery Verification Success: "
-            f"{recovery_verifications} / "
-            f"{recovery_attempts} "
-            f"({recovery_verifications / recovery_attempts * 100:.1f}%)"
-        )
-
-    else:
-
-        print(
-            "Recovery Success Rate: N/A"
-        )
-
-        print(
-            "Recovery Verification Success: N/A"
-        )
-
-    # --------------------------------------------------------
-    # Detailed report
-    # --------------------------------------------------------
-
-    print(
-        "\nDetailed Scenario Report:"
-    )
-
-    for result in results:
-
-        status = (
-            "PASS"
-            if result.get("ok")
-            else "FAIL"
-        )
-
-        if "actual_cause" in result:
-
-            details = (
-                f"cause={result.get('actual_cause')}, "
-                f"action={result.get('actual_action')}"
+            log_message = (
+                "Application errors after bad deployment"
             )
 
-        else:
+        # ----------------------------------------------------
+        # Container restart loop
+        # ----------------------------------------------------
 
-            details = result.get(
-                "reason",
-                "",
+        elif name == "container_restart_loop":
+            state.container_state = "restarting"
+            state.container_health = "unhealthy"
+            state.restart_count = 8
+
+        # ----------------------------------------------------
+        # Database unavailable
+        # ----------------------------------------------------
+
+        elif name == "database_unavailable":
+            state.db_available = False
+            state.db_connection_errors = 5
+
+        # ----------------------------------------------------
+        # Traffic spike
+        # ----------------------------------------------------
+
+        elif name == "traffic_spike":
+            state.resource_pressure = True
+
+        # ----------------------------------------------------
+        # High latency
+        # ----------------------------------------------------
+
+        elif name == "high_latency":
+            state.resource_pressure = True
+
+        # ----------------------------------------------------
+        # HTTP 400 spike
+        # ----------------------------------------------------
+
+        elif name == "http_400_spike":
+            pass
+
+        # ----------------------------------------------------
+        # Combined failure
+        # ----------------------------------------------------
+
+        elif name == "combined_failure":
+            state.version = "1.1.0-bad"
+
+            state.deployed_at = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            state.history.append(
+                {
+                    "version": "1.1.0-bad",
+                    "deployed_at": state.deployed_at,
+                    "bad": True,
+                }
             )
 
-        print(
-            f"  [{status}] "
-            f"{result['name']}: "
-            f"{details}"
+            state.container_health = "unhealthy"
+            state.container_state = "running"
+            state.resource_pressure = True
+
+            log_message = (
+                "Combined failure after bad deployment"
+            )
+
+    # IMPORTANT:
+    # add_log() acquires state.lock itself, so it must NOT
+    # be called while already holding state.lock.
+    if log_message:
+        state.add_log(
+            severity="ERROR",
+            message=log_message,
+            status="500",
         )
 
-    return (
-        0
-        if passed == total
-        else 1
+    return state.snapshot()
+
+
+# ============================================================
+# Restart service
+# ============================================================
+
+def restart_service() -> dict:
+    with state.lock:
+        state.restart_count += 1
+        state.container_state = "running"
+        state.container_health = "healthy"
+        state.scenario = "normal"
+        state.resource_pressure = False
+
+    # Outside the lock to prevent deadlock.
+    state.add_log(
+        severity="INFO",
+        message="Service restarted successfully",
     )
 
+    return state.snapshot()
 
-if __name__ == "__main__":
-    sys.exit(main())
+
+# ============================================================
+# Rollback service
+# ============================================================
+
+def rollback_service() -> dict:
+    with state.lock:
+        state.version = "1.0.0"
+        state.container_state = "running"
+        state.container_health = "healthy"
+        state.scenario = "normal"
+        state.resource_pressure = False
+
+    # Outside the lock to prevent deadlock.
+    state.add_log(
+        severity="INFO",
+        message="Service rolled back to stable version",
+    )
+
+    return state.snapshot()
+
+
+# ============================================================
+# Scale service
+# ============================================================
+
+def scale_service() -> dict:
+    with state.lock:
+        state.replicas = max(
+            2,
+            state.replicas + 1,
+        )
+
+        state.resource_pressure = False
+
+        replicas = state.replicas
+
+    # Outside the lock to prevent deadlock.
+    state.add_log(
+        severity="INFO",
+        message=(
+            f"Service scaled to {replicas} replicas"
+        ),
+    )
+
+    return state.snapshot()

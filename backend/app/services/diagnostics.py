@@ -1,4 +1,4 @@
-"""Read-only diagnostic collection for the simulated service."""
+"""Read-only diagnostic collection for the simulated production service."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
-from app.diagnostics.status import get_service_status
 from app.metrics import (
     record_tool_call,
     record_tool_failure,
@@ -15,27 +14,72 @@ from app.metrics import (
 from app.services.database_test import (
     test_database_connection,
 )
+from app.services.prometheus import (
+    prometheus_service,
+)
 
+
+# ---------------------------------------------------------------------------
+# Result helpers
+# ---------------------------------------------------------------------------
+
+def _success(
+    tool_name: str,
+    result: Any,
+) -> dict[str, Any]:
+    """Build a successful diagnostic tool response."""
+
+    return {
+        "ok": True,
+        "tool": tool_name,
+        "result": result,
+    }
+
+
+def _failure(
+    tool_name: str,
+    error: str,
+    result: Any | None = None,
+) -> dict[str, Any]:
+    """Build a failed diagnostic tool response."""
+
+    payload: dict[str, Any] = {
+        "ok": False,
+        "tool": tool_name,
+        "error": error,
+    }
+
+    if result is not None:
+        payload["result"] = result
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Sanitization
+# ---------------------------------------------------------------------------
 
 def _sanitize(payload: Any) -> Any:
-    """Recursively remove sensitive values."""
+    """Remove sensitive-looking values from diagnostic output."""
 
     if isinstance(payload, dict):
         redacted: dict[str, Any] = {}
 
+        sensitive_tokens = (
+            "password",
+            "token",
+            "webhook",
+            "api_key",
+            "authorization",
+            "secret",
+        )
+
         for key, value in payload.items():
-            lowered = key.lower()
+            lowered = str(key).lower()
 
             if any(
                 token in lowered
-                for token in (
-                    "password",
-                    "token",
-                    "webhook",
-                    "api_key",
-                    "authorization",
-                    "secret",
-                )
+                for token in sensitive_tokens
             ):
                 redacted[key] = "[redacted]"
             else:
@@ -52,35 +96,17 @@ def _sanitize(payload: Any) -> Any:
     return payload
 
 
-def _success(
-    tool: str,
-    result: Any,
-) -> dict[str, Any]:
-    return {
-        "ok": True,
-        "tool": tool,
-        "result": _sanitize(result),
-        "error": None,
-    }
-
-
-def _failure(
-    tool: str,
-    error: str,
-    result: Any = None,
-) -> dict[str, Any]:
-    return {
-        "ok": False,
-        "tool": tool,
-        "result": _sanitize(result),
-        "error": error,
-    }
-
+# ---------------------------------------------------------------------------
+# Simulated API helper
+# ---------------------------------------------------------------------------
 
 async def _simulated_get(
     path: str,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """
+    Perform a read-only request against the simulated API.
+    """
 
     url = (
         f"{settings.simulated_api_url.rstrip('/')}"
@@ -91,6 +117,7 @@ async def _simulated_get(
         async with httpx.AsyncClient(
             timeout=5.0
         ) as client:
+
             response = await client.get(
                 url,
                 params=params,
@@ -98,9 +125,10 @@ async def _simulated_get(
 
         try:
             body = response.json()
+
         except ValueError:
             body = {
-                "raw": response.text[:500]
+                "raw": response.text[:500],
             }
 
         if response.status_code >= 400:
@@ -120,7 +148,23 @@ async def _simulated_get(
             "data": body,
         }
 
+    except httpx.TimeoutException as exc:
+        return {
+            "available": False,
+            "status_code": None,
+            "error": f"timeout: {exc}",
+            "data": None,
+        }
+
     except httpx.RequestError as exc:
+        return {
+            "available": False,
+            "status_code": None,
+            "error": f"request_failed: {exc}",
+            "data": None,
+        }
+
+    except Exception as exc:
         return {
             "available": False,
             "status_code": None,
@@ -129,38 +173,151 @@ async def _simulated_get(
         }
 
 
-async def collect_prometheus_snapshot():
+# ---------------------------------------------------------------------------
+# Prometheus diagnostics
+# ---------------------------------------------------------------------------
+
+async def collect_prometheus_snapshot() -> dict[str, Any]:
+
     tool_name = "prometheus_metrics"
 
     record_tool_call(tool_name)
 
-    try:
-        status = await get_service_status()
+    queries = {
+        "error_rate_percent": (
+            "reliability_error_rate"
+        ),
+        "p95_latency_seconds": (
+            "reliability_p95_latency_seconds"
+        ),
+        "request_rate_per_second": (
+            "reliability_request_rate"
+        ),
+        "service_health": (
+            "reliability_service_health"
+        ),
+    }
 
-        return _success(
-            tool_name,
-            status,
-        )
+    metrics: dict[str, Any] = {}
+    query_errors: dict[str, str] = {}
 
-    except Exception as exc:
+    for name, promql in queries.items():
+
+        try:
+            result = await prometheus_service.scalar(
+                promql
+            )
+
+            if result.get("ok"):
+
+                metrics[name] = result.get(
+                    "value"
+                )
+
+                # Prometheus successfully answered,
+                # but the query may have no series.
+                if result.get("value") is None:
+                    query_errors[name] = (
+                        "metric returned no numeric value"
+                    )
+
+            else:
+                metrics[name] = None
+
+                query_errors[name] = (
+                    result.get("error")
+                    or "prometheus query failed"
+                )
+
+        except Exception as exc:
+
+            metrics[name] = None
+
+            query_errors[name] = str(exc)
+
+    usable_metrics = {
+        key: value
+        for key, value in metrics.items()
+        if value is not None
+    }
+
+    if not usable_metrics:
+
         record_tool_failure(tool_name)
 
         return _failure(
             tool_name,
-            str(exc),
+            "Prometheus returned no usable metric values",
+            {
+                "source": "prometheus",
+                "queries": queries,
+                "metrics": metrics,
+                "query_errors": query_errors,
+            },
         )
 
+    # ---------------------------------------------------------------
+    # Determine Prometheus service health.
+    # ---------------------------------------------------------------
+
+    health_value = metrics.get(
+        "service_health"
+    )
+
+    if health_value is None:
+        overall_status = "UNKNOWN"
+
+    elif float(health_value) >= 1:
+        overall_status = "HEALTHY"
+
+    else:
+        overall_status = "UNHEALTHY"
+
+    return _success(
+        tool_name,
+        {
+            "overall_status": overall_status,
+            "source": "prometheus",
+            "job": "operations-reliability-agent",
+
+            "metrics": metrics,
+
+            # Compatibility fields
+            # used by investigation.py
+            "error_rate_percent": metrics.get(
+                "error_rate_percent"
+            ),
+            "p95_latency_seconds": metrics.get(
+                "p95_latency_seconds"
+            ),
+            "request_rate_per_second": metrics.get(
+                "request_rate_per_second"
+            ),
+            "service_health": metrics.get(
+                "service_health"
+            ),
+
+            "queries": queries,
+            "query_errors": query_errors,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structured logs
+# ---------------------------------------------------------------------------
 
 async def collect_logs(
     service: str | None = None,
     severity: str | None = None,
     correlation_id: str | None = None,
-):
+) -> dict[str, Any]:
+
     tool_name = "structured_logs"
 
     record_tool_call(tool_name)
 
-    params: dict[str, Any] = {}
+    params: dict[str, str] = {}
 
     if service:
         params["service"] = service
@@ -169,9 +326,7 @@ async def collect_logs(
         params["severity"] = severity
 
     if correlation_id:
-        params["correlation_id"] = (
-            correlation_id
-        )
+        params["correlation_id"] = correlation_id
 
     result = await _simulated_get(
         "/internal/logs",
@@ -181,22 +336,19 @@ async def collect_logs(
     if not result["available"]:
         record_tool_failure(tool_name)
 
-        return _failure(
-            tool_name,
-            str(
-                result.get("error")
-                or "structured_logs_unavailable"
-            ),
-            result,
-        )
-
-    return _success(
-        tool_name,
-        result,
-    )
+    return {
+        "ok": result["available"],
+        "tool": tool_name,
+        "result": _sanitize(result),
+    }
 
 
-async def collect_container_health():
+# ---------------------------------------------------------------------------
+# Container health
+# ---------------------------------------------------------------------------
+
+async def collect_container_health() -> dict[str, Any]:
+
     tool_name = "container_health"
 
     record_tool_call(tool_name)
@@ -208,22 +360,19 @@ async def collect_container_health():
     if not result["available"]:
         record_tool_failure(tool_name)
 
-        return _failure(
-            tool_name,
-            str(
-                result.get("error")
-                or "container_health_unavailable"
-            ),
-            result,
-        )
-
-    return _success(
-        tool_name,
-        result,
-    )
+    return {
+        "ok": result["available"],
+        "tool": tool_name,
+        "result": _sanitize(result),
+    }
 
 
-async def collect_database_signals():
+# ---------------------------------------------------------------------------
+# Database signals
+# ---------------------------------------------------------------------------
+
+async def collect_database_signals() -> dict[str, Any]:
+
     tool_name = "database_signals"
 
     record_tool_call(tool_name)
@@ -233,56 +382,55 @@ async def collect_database_signals():
     )
 
     try:
-        select_1_result = test_database_connection()
+        select_result = (
+            test_database_connection()
+        )
+
         postgres = {
-            "available": bool(select_1_result),
-            "select_1": select_1_result,
+            "available": True,
+            "select_1": select_result,
             "error": None,
         }
 
     except Exception as exc:
+
         postgres = {
             "available": False,
             "select_1": None,
             "error": str(exc),
         }
 
-    simulated_available = bool(
+    simulated_ok = bool(
         simulated.get("available")
     )
 
-    postgres_available = bool(
+    postgres_ok = bool(
         postgres.get("available")
     )
 
-    if (
-        not simulated_available
-        and not postgres_available
-    ):
+    if not simulated_ok and not postgres_ok:
         record_tool_failure(tool_name)
 
-        return _failure(
-            tool_name,
-            (
-                "simulated_database_and_"
-                "postgres_unavailable"
+    return {
+        "ok": simulated_ok or postgres_ok,
+        "tool": tool_name,
+        "result": {
+            "simulated_service_db": _sanitize(
+                simulated
             ),
-            {
-                "simulated_service_db": simulated,
-                "reliability_postgres": postgres,
-            },
-        )
-
-    return _success(
-        tool_name,
-        {
-            "simulated_service_db": simulated,
-            "reliability_postgres": postgres,
+            "reliability_postgres": _sanitize(
+                postgres
+            ),
         },
-    )
+    }
 
 
-async def collect_deployments():
+# ---------------------------------------------------------------------------
+# Deployment diagnostics
+# ---------------------------------------------------------------------------
+
+async def collect_deployments() -> dict[str, Any]:
+
     tool_name = "deployments"
 
     record_tool_call(tool_name)
@@ -294,22 +442,19 @@ async def collect_deployments():
     if not result["available"]:
         record_tool_failure(tool_name)
 
-        return _failure(
-            tool_name,
-            str(
-                result.get("error")
-                or "deployment_information_unavailable"
-            ),
-            result,
-        )
-
-    return _success(
-        tool_name,
-        result,
-    )
+    return {
+        "ok": result["available"],
+        "tool": tool_name,
+        "result": _sanitize(result),
+    }
 
 
-async def collect_service_health():
+# ---------------------------------------------------------------------------
+# Service health
+# ---------------------------------------------------------------------------
+
+async def collect_service_health() -> dict[str, Any]:
+
     tool_name = "service_health"
 
     record_tool_call(tool_name)
@@ -321,27 +466,24 @@ async def collect_service_health():
     if not result["available"]:
         record_tool_failure(tool_name)
 
-        return _failure(
-            tool_name,
-            str(
-                result.get("error")
-                or "service_health_unavailable"
-            ),
-            result,
-        )
-
-    return _success(
-        tool_name,
-        result,
-    )
+    return {
+        "ok": result["available"],
+        "tool": tool_name,
+        "result": _sanitize(result),
+    }
 
 
-async def collect_full_diagnostics():
+# ---------------------------------------------------------------------------
+# Full diagnostics
+# ---------------------------------------------------------------------------
+
+async def collect_full_diagnostics() -> dict[str, Any]:
     """
-    Collect all read-only diagnostic signals.
+    Collect the complete read-only diagnostic snapshot.
 
-    Individual failures are preserved so one broken
-    diagnostic source does not abort the investigation.
+    IMPORTANT:
+    This function only reads diagnostic information.
+    It never performs recovery actions.
     """
 
     prometheus = (
@@ -352,7 +494,9 @@ async def collect_full_diagnostics():
         await collect_service_health()
     )
 
-    logs = await collect_logs()
+    logs = (
+        await collect_logs()
+    )
 
     container = (
         await collect_container_health()
@@ -366,22 +510,37 @@ async def collect_full_diagnostics():
         await collect_deployments()
     )
 
-    snapshot = (
-        prometheus.get("result") or {}
+    prometheus_result = (
+        prometheus.get("result")
         if prometheus.get("ok")
         else {}
     )
 
+    if not isinstance(
+        prometheus_result,
+        dict,
+    ):
+        prometheus_result = {}
+
     return {
         "service": "simulated-api-service",
-        "overall_status": snapshot.get(
-            "overall_status",
-            "UNKNOWN",
+
+        "overall_status": (
+            prometheus_result.get(
+                "overall_status",
+                "UNKNOWN",
+            )
         ),
+
         "prometheus": prometheus,
+
         "service_health": health,
+
         "logs": logs,
+
         "container": container,
+
         "database": database,
+
         "deployments": deployments,
     }

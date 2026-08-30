@@ -1,5 +1,6 @@
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -30,12 +31,6 @@ BACKEND_API_URL = "http://127.0.0.1:9000"
 # ============================================================
 # Evaluation scenario -> simulated-api scenario mapping
 # ============================================================
-#
-# The evaluation scenario names describe the test.
-# The simulated API has its own chaos scenario names.
-#
-# Keep these two namespaces separate.
-# ============================================================
 
 SCENARIO_MAP = {
     "normal_operation": "normal",
@@ -49,6 +44,41 @@ SCENARIO_MAP = {
     "client_error_spike": "http_400_spike",
     "combined_failure": "combined_failure",
 }
+
+
+# ============================================================
+# Constants
+# ============================================================
+
+PROMETHEUS_WAIT_SECONDS = 10
+
+# Agent investigation can involve multiple diagnostic tools.
+INVESTIGATION_TIMEOUT_SECONDS = 60
+
+# Polling interval while the agent is investigating.
+INVESTIGATION_POLL_SECONDS = 2
+
+# Give Prometheus enough time to age old samples.
+METRIC_AGING_SECONDS = 30
+
+
+# ============================================================
+# Generic result helpers
+# ============================================================
+
+def failed_result(name: str, reason: str) -> dict:
+    """Create a consistent failed scenario result."""
+
+    return {
+        "name": name,
+        "ok": False,
+        "reason": reason,
+        "diagnosis_correct": False,
+        "recommendation_correct": False,
+        "approval_policy_compliant": False,
+        "recovery_success": False,
+        "recovery_verified": False,
+    }
 
 
 # ============================================================
@@ -71,10 +101,13 @@ def reset_simulated_api() -> bool:
             )
             return False
 
+        print("  Chaos state reset successfully.")
         return True
 
     except requests.RequestException as exc:
-        print(f"  [ERROR] Chaos reset request failed: {exc}")
+        print(
+            f"  [ERROR] Chaos reset request failed: {exc}"
+        )
         return False
 
 
@@ -126,39 +159,350 @@ def inject_chaos(evaluation_name: str) -> bool:
 # Traffic generation
 # ============================================================
 
-def send_traffic() -> None:
+def send_single_event(index: int) -> bool:
+    """Send one event request."""
+
+    try:
+        response = requests.post(
+            f"{SIMULATED_API_URL}/events",
+            json={
+                "event_id": (
+                    f"eval-{time.time_ns()}-{index}"
+                ),
+                "timestamp": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(),
+                ),
+                "service": "simulated-api-service",
+                "operation": "create_event",
+                "status": "success",
+                "latency_ms": 15.0,
+            },
+            timeout=3,
+        )
+
+        return response.status_code < 500
+
+    except requests.RequestException:
+        return False
+
+
+def send_normal_traffic() -> None:
     """
-    Generate metric data points by calling simulated-api.
+    Generate normal evaluation traffic.
+
+    We intentionally send both /events and /health requests
+    so multiple metrics/log signals are produced.
     """
 
-    for index in range(30):
+    successful = 0
+    total = 30
+
+    for index in range(total):
+
+        if send_single_event(index):
+            successful += 1
+
         try:
-            requests.post(
-                f"{SIMULATED_API_URL}/events",
-                json={
-                    "event_id": (
-                        f"eval-{time.time_ns()}-{index}"
-                    ),
-                    "timestamp": time.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ",
-                        time.gmtime(),
-                    ),
-                    "service": "simulated-api-service",
-                    "operation": "create_event",
-                    "status": "success",
-                    "latency_ms": 15.0,
-                },
-                timeout=1,
-            )
-
             requests.get(
                 f"{SIMULATED_API_URL}/health",
-                timeout=1,
+                timeout=3,
+            )
+        except requests.RequestException:
+            pass
+
+    print(
+        f"  Normal traffic generated: "
+        f"{successful}/{total}"
+    )
+
+
+def send_traffic_spike() -> None:
+    """
+    Generate a real burst of concurrent traffic.
+
+    This is intentionally much stronger than normal traffic
+    so Prometheus can observe a measurable request-rate spike.
+    """
+
+    total_requests = 200
+    workers = 25
+
+    print(
+        f"  Generating traffic spike: "
+        f"{total_requests} requests "
+        f"with {workers} workers..."
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=workers
+    ) as executor:
+
+        results = list(
+            executor.map(
+                send_single_event,
+                range(total_requests),
+            )
+        )
+
+    successful = sum(
+        1
+        for result in results
+        if result
+    )
+
+    print(
+        f"  Traffic spike generated: "
+        f"{successful}/{total_requests}"
+    )
+
+
+def send_traffic(scenario_name: str) -> None:
+    """
+    Generate scenario-appropriate traffic.
+    """
+
+    if scenario_name == "traffic_spike":
+        send_traffic_spike()
+    else:
+        send_normal_traffic()
+
+
+# ============================================================
+# Investigation polling
+# ============================================================
+
+def fetch_investigation(
+    investigation_id: int,
+) -> dict | None:
+    """
+    Fetch one investigation payload from the backend.
+    """
+
+    try:
+        response = requests.get(
+            f"{BACKEND_API_URL}/api/investigations/"
+            f"{investigation_id}",
+            timeout=10,
+        )
+
+    except requests.RequestException as exc:
+        print(
+            f"  [WARN] Investigation fetch failed: {exc}"
+        )
+        return None
+
+    if response.status_code != 200:
+        print(
+            f"  [WARN] Investigation fetch returned "
+            f"{response.status_code}"
+        )
+        return None
+
+    try:
+        return response.json()
+
+    except ValueError:
+        print(
+            "  [WARN] Investigation response "
+            "was not valid JSON."
+        )
+        return None
+
+
+def wait_for_investigation(
+    investigation_id: int,
+    timeout_seconds: int = INVESTIGATION_TIMEOUT_SECONDS,
+) -> dict | None:
+    """
+    Wait until the investigation has reached a meaningful
+    terminal/decision state.
+
+    Backend states handled here:
+
+        RECEIVED
+            -> keep polling
+
+        INVESTIGATING
+            -> keep polling
+
+        RECOMMENDED
+            -> diagnosis/recommendation complete
+
+        AWAITING_APPROVAL
+            -> diagnosis complete and approval required
+
+        RECOVERED
+            -> recovery completed
+
+        FAILED
+            -> investigation/recovery failed
+
+        REJECTED
+            -> action rejected
+
+        ESCALATED
+            -> escalated for human handling
+    """
+
+    print(
+        "  Waiting for investigation to complete..."
+    )
+
+    deadline = (
+        time.monotonic()
+        + timeout_seconds
+    )
+
+    last_status = None
+    last_stage = None
+
+    while time.monotonic() < deadline:
+
+        payload = fetch_investigation(
+            investigation_id
+        )
+
+        if payload is None:
+            time.sleep(
+                INVESTIGATION_POLL_SECONDS
+            )
+            continue
+
+        investigation = payload.get(
+            "investigation"
+        )
+
+        if not investigation:
+            time.sleep(
+                INVESTIGATION_POLL_SECONDS
+            )
+            continue
+
+        status = investigation.get(
+            "status"
+        )
+
+        stage = investigation.get(
+            "stage"
+        )
+
+        cause = investigation.get(
+            "likely_cause"
+        )
+
+        action = investigation.get(
+            "recommended_action_type"
+        )
+
+        if (
+            status != last_status
+            or stage != last_stage
+        ):
+
+            print(
+                f"    Investigation state: "
+                f"status={status}, "
+                f"stage={stage}"
             )
 
-        except requests.RequestException:
-            # Traffic generation is best-effort.
-            pass
+            last_status = status
+            last_stage = stage
+
+        # ----------------------------------------------------
+        # High-impact action:
+        # AWAITING_APPROVAL means diagnosis is complete.
+        # ----------------------------------------------------
+
+        if (
+            status == "AWAITING_APPROVAL"
+            or stage == "AWAITING_APPROVAL"
+        ):
+            print(
+                f"    Investigation ready for approval: "
+                f"cause={cause}, action={action}"
+            )
+
+            return payload
+
+        # ----------------------------------------------------
+        # Diagnosis/recommendation complete.
+        #
+        # IMPORTANT:
+        # The backend can use:
+        #
+        #     status = RECOMMENDED
+        #     stage  = DIAGNOSING
+        #
+        # This is NOT an active investigation anymore.
+        # It is a valid decision state for evaluation.
+        # ----------------------------------------------------
+
+        if status == "RECOMMENDED":
+            print(
+                f"    Investigation produced diagnosis: "
+                f"cause={cause}, action={action}"
+            )
+
+            return payload
+
+        # ----------------------------------------------------
+        # Non-recovery terminal states
+        # ----------------------------------------------------
+
+        terminal_statuses = {
+            "RECOVERED",
+            "FAILED",
+            "REJECTED",
+            "ESCALATED",
+        }
+
+        if status in terminal_statuses:
+            print(
+                f"    Investigation reached terminal "
+                f"state: {status}"
+            )
+
+            return payload
+
+        # ----------------------------------------------------
+        # Generic fallback:
+        #
+        # If a backend implementation has produced a real
+        # cause + action and moved beyond the initial states,
+        # allow the evaluator to continue.
+        # ----------------------------------------------------
+
+        if (
+            cause is not None
+            and action is not None
+            and status not in {
+                "RECEIVED",
+                "INVESTIGATING",
+            }
+            and stage not in {
+                "RECEIVED",
+                "INVESTIGATING",
+            }
+        ):
+            print(
+                f"    Investigation produced diagnosis: "
+                f"cause={cause}, action={action}"
+            )
+
+            return payload
+
+        time.sleep(
+            INVESTIGATION_POLL_SECONDS
+        )
+
+    print(
+        f"  [ERROR] Investigation {investigation_id} "
+        f"did not complete within "
+        f"{timeout_seconds}s."
+    )
+
+    return None
 
 
 # ============================================================
@@ -166,6 +510,7 @@ def send_traffic() -> None:
 # ============================================================
 
 def run_live_scenario(scenario: dict) -> dict:
+
     name = scenario["name"]
 
     alert = scenario["alert"]
@@ -173,59 +518,85 @@ def run_live_scenario(scenario: dict) -> dict:
     expected_action = scenario["expected_action"]
 
     print()
-    print(f"--- Running Live Scenario: {name} ---")
+    print("=" * 60)
+    print(
+        f"--- Running Live Scenario: {name} ---"
+    )
+    print("=" * 60)
 
     # --------------------------------------------------------
     # 1. Reset simulated API
     # --------------------------------------------------------
 
+    print()
+    print("  [1/10] Resetting simulated API...")
+
     if not reset_simulated_api():
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "chaos_reset_failed",
-            "diagnosis_correct": False,
-            "recommendation_correct": False,
-            "approval_policy_compliant": False,
-            "recovery_success": False,
-            "recovery_verified": False,
-        }
+        return failed_result(
+            name,
+            "chaos_reset_failed",
+        )
 
     # --------------------------------------------------------
     # 2. Give previous Prometheus data time to age
     # --------------------------------------------------------
 
-    print("  Waiting 30s for old metrics to age out...")
-    time.sleep(30)
+    print()
+    print(
+        "  [2/10] Waiting "
+        f"{METRIC_AGING_SECONDS}s "
+        "for old metrics to age out..."
+    )
+
+    time.sleep(
+        METRIC_AGING_SECONDS
+    )
 
     # --------------------------------------------------------
     # 3. Inject scenario
     # --------------------------------------------------------
 
+    print()
+    print("  [3/10] Injecting scenario...")
+
     if not inject_chaos(name):
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "chaos_injection_failed",
-            "diagnosis_correct": False,
-            "recommendation_correct": False,
-            "approval_policy_compliant": False,
-            "recovery_success": False,
-            "recovery_verified": False,
-        }
+        return failed_result(
+            name,
+            "chaos_injection_failed",
+        )
 
     # --------------------------------------------------------
     # 4. Generate traffic
     # --------------------------------------------------------
 
-    send_traffic()
+    print()
+    print("  [4/10] Generating traffic...")
 
-    print("  Waiting 6s for Prometheus scrape...")
-    time.sleep(6)
+    send_traffic(name)
 
     # --------------------------------------------------------
-    # 5. Send alert to backend webhook
+    # 5. Wait for Prometheus
     # --------------------------------------------------------
+
+    print()
+    print(
+        "  [5/10] Waiting "
+        f"{PROMETHEUS_WAIT_SECONDS}s "
+        "for Prometheus scrape..."
+    )
+
+    time.sleep(
+        PROMETHEUS_WAIT_SECONDS
+    )
+
+    # --------------------------------------------------------
+    # 6. Send alert to backend webhook
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "  [6/10] Sending alert to backend..."
+    )
 
     webhook_payload = {
         "status": "firing",
@@ -261,152 +632,135 @@ def run_live_scenario(scenario: dict) -> dict:
             json=webhook_payload,
             timeout=10,
         )
+
     except requests.RequestException as exc:
+
         print(
-            f"  [ERROR] Alert webhook request failed: {exc}"
+            f"  [ERROR] Alert webhook request failed: "
+            f"{exc}"
         )
 
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "webhook_request_failed",
-            "diagnosis_correct": False,
-            "recommendation_correct": False,
-            "approval_policy_compliant": False,
-            "recovery_success": False,
-            "recovery_verified": False,
-        }
+        return failed_result(
+            name,
+            "webhook_request_failed",
+        )
 
     if response.status_code != 200:
+
         print(
             f"  [ERROR] Alert webhook failed: "
             f"{response.status_code}"
         )
-        print(f"  Response: {response.text}")
 
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "webhook_failed",
-            "diagnosis_correct": False,
-            "recommendation_correct": False,
-            "approval_policy_compliant": False,
-            "recovery_success": False,
-            "recovery_verified": False,
-        }
+        print(
+            f"  Response: {response.text}"
+        )
 
-    webhook_res = response.json()
+        return failed_result(
+            name,
+            "webhook_failed",
+        )
 
-    ingested = webhook_res.get("ingested", [])
+    try:
+        webhook_res = response.json()
+
+    except ValueError:
+
+        print(
+            "  [ERROR] Webhook response "
+            "was not valid JSON."
+        )
+
+        return failed_result(
+            name,
+            "invalid_webhook_response",
+        )
+
+    ingested = webhook_res.get(
+        "ingested",
+        [],
+    )
 
     if not ingested:
+
         print(
             "  [ERROR] Alert was not ingested."
         )
-        print(f"  Response: {webhook_res}")
 
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "alert_skipped",
-            "diagnosis_correct": False,
-            "recommendation_correct": False,
-            "approval_policy_compliant": False,
-            "recovery_success": False,
-            "recovery_verified": False,
-        }
+        print(
+            f"  Response: {webhook_res}"
+        )
+
+        return failed_result(
+            name,
+            "alert_skipped",
+        )
 
     investigation_id = ingested[0].get(
         "investigation_id"
     )
 
     if not investigation_id:
+
         print(
             "  [ERROR] Webhook did not return "
             "an investigation ID."
         )
 
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "no_investigation_id",
-            "diagnosis_correct": False,
-            "recommendation_correct": False,
-            "approval_policy_compliant": False,
-            "recovery_success": False,
-            "recovery_verified": False,
-        }
+        return failed_result(
+            name,
+            "no_investigation_id",
+        )
 
     print(
-        f"  Investigation ID: {investigation_id}"
+        f"  Investigation ID: "
+        f"{investigation_id}"
     )
 
     # --------------------------------------------------------
-    # 6. Fetch investigation
+    # 7. WAIT for investigation
     # --------------------------------------------------------
 
-    try:
-        response = requests.get(
-            f"{BACKEND_API_URL}/api/investigations/"
-            f"{investigation_id}",
-            timeout=10,
+    print()
+    print(
+        "  [7/10] Waiting for investigation..."
+    )
+
+    payload = wait_for_investigation(
+        investigation_id
+    )
+
+    if payload is None:
+
+        return failed_result(
+            name,
+            "investigation_timeout",
         )
-    except requests.RequestException as exc:
-        print(
-            f"  [ERROR] Fetching investigation failed: "
-            f"{exc}"
-        )
-
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "fetch_investigation_request_failed",
-            "diagnosis_correct": False,
-            "recommendation_correct": False,
-            "approval_policy_compliant": False,
-            "recovery_success": False,
-            "recovery_verified": False,
-        }
-
-    if response.status_code != 200:
-        print(
-            f"  [ERROR] Fetching investigation "
-            f"{investigation_id} failed: "
-            f"{response.text}"
-        )
-
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "fetch_investigation_failed",
-            "diagnosis_correct": False,
-            "recommendation_correct": False,
-            "approval_policy_compliant": False,
-            "recovery_success": False,
-            "recovery_verified": False,
-        }
-
-    payload = response.json()
 
     investigation = payload.get(
         "investigation"
     )
 
     if not investigation:
+
         print(
-            "  [ERROR] Investigation payload is missing."
+            "  [ERROR] Investigation payload "
+            "is missing."
         )
 
-        return {
-            "name": name,
-            "ok": False,
-            "reason": "invalid_investigation_payload",
-            "diagnosis_correct": False,
-            "recommendation_correct": False,
-            "approval_policy_compliant": False,
-            "recovery_success": False,
-            "recovery_verified": False,
-        }
+        return failed_result(
+            name,
+            "invalid_investigation_payload",
+        )
+
+    # --------------------------------------------------------
+    # 8. Validate investigation
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "  [8/10] Validating investigation..."
+    )
 
     actual_cause = investigation.get(
         "likely_cause"
@@ -424,9 +778,13 @@ def run_live_scenario(scenario: dict) -> dict:
         "approval_status"
     )
 
-    # --------------------------------------------------------
-    # 7. Validate diagnosis
-    # --------------------------------------------------------
+    status = investigation.get(
+        "status"
+    )
+
+    stage = investigation.get(
+        "stage"
+    )
 
     cause_correct = (
         actual_cause == expected_cause
@@ -441,7 +799,8 @@ def run_live_scenario(scenario: dict) -> dict:
     )
 
     approval_correct = (
-        approval_required == expected_approval
+        approval_required
+        == expected_approval
     )
 
     print(
@@ -457,25 +816,46 @@ def run_live_scenario(scenario: dict) -> dict:
     )
 
     print(
-        f"  Approval Required: {approval_required} "
+        f"  Approval Required: "
+        f"{approval_required} "
         f"(Expected: {expected_approval}) -> "
         f"{'OK' if approval_correct else 'FAIL'}"
     )
 
+    print(
+        f"  Investigation Status: {status}"
+    )
+
+    print(
+        f"  Investigation Stage: {stage}"
+    )
+
     # --------------------------------------------------------
-    # 8. Recovery values
+    # 9. Recovery policy
     # --------------------------------------------------------
+
+    print()
+    print(
+        "  [9/10] Processing recovery policy..."
+    )
 
     recovery_ok = None
     recovery_verified = None
 
     # --------------------------------------------------------
-    # 9. High-impact action
+    # High-impact action
     # --------------------------------------------------------
 
     if approval_required:
 
+        # ----------------------------------------------------
+        # Safety requirement:
+        # high-impact action MUST remain pending until
+        # explicit approval.
+        # ----------------------------------------------------
+
         if approval_status != "pending":
+
             print(
                 f"  [ERROR] Expected pending approval, "
                 f"got {approval_status}"
@@ -495,6 +875,11 @@ def run_live_scenario(scenario: dict) -> dict:
             }
 
         print(
+            f"  Approval Required for "
+            f"{actual_action}: YES"
+        )
+
+        print(
             f"  Approving action {actual_action}..."
         )
 
@@ -511,9 +896,11 @@ def run_live_scenario(scenario: dict) -> dict:
                 f"{BACKEND_API_URL}/api/investigations/"
                 f"{investigation_id}/approve",
                 json=approve_body,
-                timeout=20,
+                timeout=30,
             )
+
         except requests.RequestException as exc:
+
             print(
                 f"  [ERROR] Action approval request "
                 f"failed: {exc}"
@@ -533,11 +920,15 @@ def run_live_scenario(scenario: dict) -> dict:
             }
 
         if response.status_code != 200:
+
             print(
                 f"  [ERROR] Action approval failed: "
                 f"{response.status_code}"
             )
-            print(f"  Response: {response.text}")
+
+            print(
+                f"  Response: {response.text}"
+            )
 
             return {
                 "name": name,
@@ -552,11 +943,35 @@ def run_live_scenario(scenario: dict) -> dict:
                 "actual_action": actual_action,
             }
 
-        approve_res = response.json()
+        try:
+            approve_res = response.json()
 
-        updated_inv = approve_res.get(
-            "investigation"
-        ) or {}
+        except ValueError:
+
+            print(
+                "  [ERROR] Approval response "
+                "was not valid JSON."
+            )
+
+            return {
+                "name": name,
+                "ok": False,
+                "reason": "invalid_approval_response",
+                "diagnosis_correct": cause_correct,
+                "recommendation_correct": action_correct,
+                "approval_policy_compliant": approval_correct,
+                "recovery_success": False,
+                "recovery_verified": False,
+                "actual_cause": actual_cause,
+                "actual_action": actual_action,
+            }
+
+        updated_inv = (
+            approve_res.get(
+                "investigation"
+            )
+            or {}
+        )
 
         recovery_ok = (
             updated_inv.get("status")
@@ -577,7 +992,8 @@ def run_live_scenario(scenario: dict) -> dict:
         )
 
         print(
-            f"  Recovery Success: {recovery_ok} -> "
+            f"  Recovery Success: "
+            f"{recovery_ok} -> "
             f"{'OK' if recovery_ok else 'FAIL'}"
         )
 
@@ -588,28 +1004,54 @@ def run_live_scenario(scenario: dict) -> dict:
         )
 
     # --------------------------------------------------------
-    # 10. Non-recovery actions
+    # Non-recovery actions
     # --------------------------------------------------------
 
     elif actual_action in {
         "observe",
         "escalate",
     }:
+
+        print(
+            f"  Action {actual_action} "
+            "does not perform automatic recovery."
+        )
+
         recovery_ok = True
         recovery_verified = True
 
+        print(
+            "  Recovery: N/A / not required -> OK"
+        )
+
+    else:
+
+        print(
+            f"  [ERROR] Unexpected action type: "
+            f"{actual_action}"
+        )
+
+        recovery_ok = False
+        recovery_verified = False
+
     # --------------------------------------------------------
-    # 11. Final scenario result
+    # 10. Final scenario result
     # --------------------------------------------------------
+
+    print()
+    print(
+        "  [10/10] Calculating scenario result..."
+    )
 
     ok = (
         cause_correct
         and action_correct
         and approval_correct
         and recovery_ok is not False
+        and recovery_verified is not False
     )
 
-    return {
+    result = {
         "name": name,
         "ok": ok,
         "diagnosis_correct": cause_correct,
@@ -621,6 +1063,13 @@ def run_live_scenario(scenario: dict) -> dict:
         "actual_action": actual_action,
     }
 
+    print(
+        f"  [{'PASS' if ok else 'FAIL'}] "
+        f"Scenario {name}"
+    )
+
+    return result
+
 
 # ============================================================
 # Main evaluation
@@ -628,9 +1077,12 @@ def run_live_scenario(scenario: dict) -> dict:
 
 def main() -> int:
 
+    print()
+    print("=" * 60)
     print(
         "Starting Live Integration Evaluation..."
     )
+    print("=" * 60)
 
     print(
         f"Target simulated-api: "
@@ -643,29 +1095,39 @@ def main() -> int:
     )
 
     print(
-        f"Evaluation scenarios: {len(SCENARIOS)}"
+        f"Evaluation scenarios: "
+        f"{len(SCENARIOS)}"
+    )
+
+    print(
+        f"Investigation timeout: "
+        f"{INVESTIGATION_TIMEOUT_SECONDS}s"
     )
 
     results = []
 
     # --------------------------------------------------------
-    # Validate scenario mappings before running
+    # Validate scenario mappings
     # --------------------------------------------------------
 
     missing_mappings = [
         scenario["name"]
         for scenario in SCENARIOS
-        if scenario["name"] not in SCENARIO_MAP
+        if scenario["name"]
+        not in SCENARIO_MAP
     ]
 
     if missing_mappings:
+
         print()
         print(
             "[ERROR] Missing scenario mappings:"
         )
 
         for name in missing_mappings:
-            print(f"  - {name}")
+            print(
+                f"  - {name}"
+            )
 
         return 1
 
@@ -676,32 +1138,41 @@ def main() -> int:
     for scenario in SCENARIOS:
 
         try:
+
             result = run_live_scenario(
                 scenario
             )
 
             results.append(result)
 
+        except KeyboardInterrupt:
+
+            print()
+            print(
+                "[ERROR] Evaluation interrupted "
+                "by user."
+            )
+
+            reset_simulated_api()
+            return 1
+
         except Exception as exc:
 
+            print()
             print(
                 f"  [CRITICAL ERROR] Scenario "
-                f"{scenario['name']} crashed: {exc}"
+                f"{scenario['name']} crashed:"
+            )
+
+            print(
+                f"  {type(exc).__name__}: {exc}"
             )
 
             results.append(
-                {
-                    "name": scenario["name"],
-                    "ok": False,
-                    "reason": (
-                        f"exception: {exc}"
-                    ),
-                    "diagnosis_correct": False,
-                    "recommendation_correct": False,
-                    "approval_policy_compliant": False,
-                    "recovery_success": False,
-                    "recovery_verified": False,
-                }
+                failed_result(
+                    scenario["name"],
+                    f"exception: {exc}",
+                )
             )
 
     # --------------------------------------------------------
@@ -709,7 +1180,9 @@ def main() -> int:
     # --------------------------------------------------------
 
     print()
-    print("Resetting simulated API...")
+    print(
+        "Resetting simulated API..."
+    )
 
     reset_simulated_api()
 
@@ -719,7 +1192,9 @@ def main() -> int:
 
     print()
     print("=" * 60)
-    print("LIVE EVALUATION SUMMARY")
+    print(
+        "LIVE EVALUATION SUMMARY"
+    )
     print("=" * 60)
 
     total = len(results)
@@ -733,7 +1208,9 @@ def main() -> int:
     diagnosis_correct = sum(
         1
         for result in results
-        if result.get("diagnosis_correct")
+        if result.get(
+            "diagnosis_correct"
+        )
     )
 
     recommendation_correct = sum(
@@ -770,6 +1247,15 @@ def main() -> int:
         is True
     )
 
+    recovery_verification_attempts = sum(
+        1
+        for result in results
+        if result.get(
+            "recovery_verified"
+        )
+        is not None
+    )
+
     recovery_verifications = sum(
         1
         for result in results
@@ -784,6 +1270,7 @@ def main() -> int:
     )
 
     if total:
+
         print(
             f"Passed Scenarios: "
             f"{passed} / {total} "
@@ -808,7 +1295,7 @@ def main() -> int:
             f"({policy_compliant / total * 100:.1f}%)"
         )
 
-    if recovery_attempts > 0:
+    if recovery_attempts:
 
         print(
             f"Recovery Success Rate: "
@@ -817,17 +1304,22 @@ def main() -> int:
             f"({recovery_successes / recovery_attempts * 100:.1f}%)"
         )
 
-        print(
-            f"Recovery Verification Success: "
-            f"{recovery_verifications} / "
-            f"{recovery_attempts} "
-            f"({recovery_verifications / recovery_attempts * 100:.1f}%)"
-        )
-
     else:
+
         print(
             "Recovery Success Rate: N/A"
         )
+
+    if recovery_verification_attempts:
+
+        print(
+            f"Recovery Verification Success: "
+            f"{recovery_verifications} / "
+            f"{recovery_verification_attempts} "
+            f"({recovery_verifications / recovery_verification_attempts * 100:.1f}%)"
+        )
+
+    else:
 
         print(
             "Recovery Verification Success: N/A"
@@ -838,7 +1330,9 @@ def main() -> int:
     # --------------------------------------------------------
 
     print()
-    print("Detailed Scenario Report:")
+    print(
+        "Detailed Scenario Report:"
+    )
 
     for result in results:
 
@@ -852,7 +1346,9 @@ def main() -> int:
 
             details = (
                 f"cause={result.get('actual_cause')}, "
-                f"action={result.get('actual_action')}"
+                f"action={result.get('actual_action')}, "
+                f"recovery={result.get('recovery_success')}, "
+                f"verified={result.get('recovery_verified')}"
             )
 
         else:
@@ -868,12 +1364,66 @@ def main() -> int:
             f"{details}"
         )
 
+    # --------------------------------------------------------
+    # Failed scenarios
+    # --------------------------------------------------------
+
+    failed = [
+        result
+        for result in results
+        if not result.get("ok")
+    ]
+
+    if failed:
+
+        print()
+        print(
+            "Failed Scenarios:"
+        )
+
+        for result in failed:
+
+            print(
+                f"  - {result['name']}: "
+                f"{result.get('reason', 'validation_failed')}"
+            )
+
+    # --------------------------------------------------------
+    # Final result
+    # --------------------------------------------------------
+
     print()
+    print("=" * 60)
+
+    if (
+        total > 0
+        and passed == total
+    ):
+
+        print(
+            "FINAL RESULT: PASS"
+        )
+
+        print(
+            f"{passed}/{total} scenarios passed."
+        )
+
+    else:
+
+        print(
+            "FINAL RESULT: FAIL"
+        )
+
+        print(
+            f"{passed}/{total} scenarios passed."
+        )
+
     print("=" * 60)
 
     return (
         0
-        if total > 0 and passed == total
+        if total > 0
+        and passed == total
         else 1
     )
 

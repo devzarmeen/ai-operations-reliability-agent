@@ -19,11 +19,28 @@ from app.models.investigation import (
     RecoveryVerification,
 )
 from app.safety.enforcement import requires_approval
-from app.services.diagnostics import collect_full_diagnostics
-from app.tools.actions import execute_controlled_action
+from app.services.diagnostics import (
+    collect_full_diagnostics,
+)
+from app.tools.actions import (
+    execute_controlled_action,
+)
 
 
-router = APIRouter(prefix="/api", tags=["Investigations"])
+router = APIRouter(
+    prefix="/api",
+    tags=["Investigations"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _now() -> datetime:
+    """Return current UTC time."""
+
+    return datetime.now(timezone.utc)
 
 
 def _service_recovered(
@@ -33,11 +50,19 @@ def _service_recovered(
     """
     Verify recovery using live simulated-service health.
 
-    Prometheus may lag immediately after a recovery action, so the
-    live /health response is preferred for the primary recovery check.
+    Primary source:
+        /health
+
+    Prometheus is treated as supporting evidence because
+    Prometheus can lag immediately after a recovery action.
     """
+
     if not snapshot:
         return False
+
+    # ---------------------------------------------------------------
+    # Live service health
+    # ---------------------------------------------------------------
 
     health_wrapper = (
         snapshot.get("service_health") or {}
@@ -56,8 +81,19 @@ def _service_recovered(
         and health_data.get("status") == "healthy"
     )
 
+    if not live_healthy:
+        return False
+
+    # ---------------------------------------------------------------
+    # Determine current scenario
+    # ---------------------------------------------------------------
+
+    execution_result = (
+        execution.get("result") or {}
+    )
+
     execution_state = (
-        (execution.get("result") or {}).get("state") or {}
+        execution_result.get("state") or {}
     )
 
     scenario = (
@@ -65,41 +101,49 @@ def _service_recovered(
         or execution_state.get("scenario")
     )
 
+    # A normal state is obviously recovered.
+    #
+    # recovery_after_failure is accepted because the
+    # simulated API may explicitly report this transitional
+    # state after a successful recovery action.
     acceptable_scenarios = {
         None,
         "normal",
-        "false_positive",
         "recovery_after_failure",
     }
 
-    scenario_ok = scenario in acceptable_scenarios
+    if scenario in acceptable_scenarios:
+        return True
 
-    prometheus_ok = (
-        snapshot.get("overall_status") == "HEALTHY"
+    # ---------------------------------------------------------------
+    # Prometheus supporting evidence
+    # ---------------------------------------------------------------
+
+    prometheus_status = (
+        snapshot.get("overall_status")
     )
 
-    return bool(
-        live_healthy
-        and (scenario_ok or prometheus_ok)
+    prometheus_healthy = (
+        prometheus_status == "HEALTHY"
     )
 
-
-class DecisionBody(BaseModel):
-    operator: str = "operator"
-    note: str | None = None
+    return prometheus_healthy
 
 
 def _investigation_payload(
     session: Session,
     investigation: Investigation,
 ) -> dict:
+
     events = session.exec(
         select(InvestigationEvent)
         .where(
             InvestigationEvent.investigation_id
             == investigation.id
         )
-        .order_by(InvestigationEvent.id.asc())
+        .order_by(
+            InvestigationEvent.id.asc()
+        )
     ).all()
 
     approvals = session.exec(
@@ -108,7 +152,9 @@ def _investigation_payload(
             ApprovalRequest.investigation_id
             == investigation.id
         )
-        .order_by(ApprovalRequest.id.desc())
+        .order_by(
+            ApprovalRequest.id.desc()
+        )
     ).all()
 
     recoveries = session.exec(
@@ -117,7 +163,9 @@ def _investigation_payload(
             RecoveryVerification.investigation_id
             == investigation.id
         )
-        .order_by(RecoveryVerification.id.desc())
+        .order_by(
+            RecoveryVerification.id.desc()
+        )
     ).all()
 
     return {
@@ -128,21 +176,42 @@ def _investigation_payload(
     }
 
 
+# ---------------------------------------------------------------------------
+# Request model
+# ---------------------------------------------------------------------------
+
+class DecisionBody(BaseModel):
+    operator: str = "operator"
+    note: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Investigation routes
+# ---------------------------------------------------------------------------
+
 @router.get("/investigations")
 def list_investigations():
+
     with Session(engine) as session:
+
         return session.exec(
             select(Investigation)
-            .order_by(Investigation.id.desc())
+            .order_by(
+                Investigation.id.desc()
+            )
         ).all()
 
 
 @router.get("/investigations/latest")
 def latest_investigation():
+
     with Session(engine) as session:
+
         investigation = session.exec(
             select(Investigation)
-            .order_by(Investigation.id.desc())
+            .order_by(
+                Investigation.id.desc()
+            )
         ).first()
 
         if investigation is None:
@@ -163,7 +232,9 @@ def latest_investigation():
 def get_investigation(
     investigation_id: int,
 ):
+
     with Session(engine) as session:
+
         investigation = session.get(
             Investigation,
             investigation_id,
@@ -181,11 +252,18 @@ def get_investigation(
         )
 
 
-@router.post("/investigations/{investigation_id}/approve")
+# ---------------------------------------------------------------------------
+# Approval endpoints
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/investigations/{investigation_id}/approve"
+)
 async def approve_investigation(
     investigation_id: int,
     body: DecisionBody,
 ):
+
     return await _decide(
         investigation_id,
         approved=True,
@@ -193,17 +271,24 @@ async def approve_investigation(
     )
 
 
-@router.post("/investigations/{investigation_id}/reject")
+@router.post(
+    "/investigations/{investigation_id}/reject"
+)
 async def reject_investigation(
     investigation_id: int,
     body: DecisionBody,
 ):
+
     return await _decide(
         investigation_id,
         approved=False,
         body=body,
     )
 
+
+# ---------------------------------------------------------------------------
+# Approval decision
+# ---------------------------------------------------------------------------
 
 async def _decide(
     investigation_id: int,
@@ -213,10 +298,16 @@ async def _decide(
     """
     Apply an explicit human approval/rejection.
 
-    High-impact actions are never executed before approval.
+    High-impact actions are NEVER executed before
+    explicit human approval.
     """
 
+    # ===============================================================
+    # STEP 1 — Validate and record human decision
+    # ===============================================================
+
     with Session(engine) as session:
+
         investigation = session.get(
             Investigation,
             investigation_id,
@@ -237,7 +328,9 @@ async def _decide(
             .where(
                 ApprovalRequest.status == "pending"
             )
-            .order_by(ApprovalRequest.id.desc())
+            .order_by(
+                ApprovalRequest.id.desc()
+            )
         ).first()
 
         if approval is None:
@@ -246,39 +339,36 @@ async def _decide(
                 detail="No pending approval request",
             )
 
+        action_type = approval.action_type
+
         if not requires_approval(
-            approval.action_type
+            action_type
         ):
             raise HTTPException(
                 status_code=400,
                 detail="Action is not high-impact",
             )
 
-        approval.status = (
+        decision = (
             "approved"
             if approved
             else "rejected"
         )
 
-        approval.decided_at = datetime.now(
-            timezone.utc
-        )
+        approval.status = decision
+        approval.decided_at = _now()
         approval.decided_by = body.operator
         approval.decision_note = body.note
 
-        investigation.approval_status = (
-            approval.status
-        )
-        investigation.updated_at = datetime.now(
-            timezone.utc
-        )
+        investigation.approval_status = decision
+        investigation.updated_at = _now()
 
         session.add(
             InvestigationEvent(
                 investigation_id=investigation_id,
                 incident_id=investigation.incident_id,
                 event_type="approval_decision",
-                decision=approval.status,
+                decision=decision,
                 details=(
                     f"operator={body.operator}"
                 ),
@@ -287,14 +377,18 @@ async def _decide(
 
         session.add(approval)
         session.add(investigation)
+
         session.commit()
 
         session.refresh(approval)
         session.refresh(investigation)
 
         approval_id = approval.id
-        action_type = approval.action_type
         incident_id = investigation.incident_id
+
+    # ===============================================================
+    # Metrics
+    # ===============================================================
 
     APPROVAL_DECISIONS.labels(
         decision=(
@@ -304,22 +398,34 @@ async def _decide(
         )
     ).inc()
 
-    # Rejected action: never execute it.
+    # ===============================================================
+    # STEP 2 — Rejection
+    # ===============================================================
+
     if not approved:
+
         with Session(engine) as session:
+
             investigation = session.get(
                 Investigation,
                 investigation_id,
             )
 
+            if investigation is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Investigation not found",
+                )
+
             investigation.stage = "ESCALATED"
             investigation.status = "REJECTED"
-            investigation.updated_at = datetime.now(
-                timezone.utc
-            )
+            investigation.updated_at = _now()
 
             session.add(investigation)
+
             session.commit()
+
+            session.refresh(investigation)
 
             INVESTIGATIONS_COMPLETED.labels(
                 outcome="rejected"
@@ -330,22 +436,38 @@ async def _decide(
                 investigation,
             )
 
-    # Execute ONLY after explicit approval.
+    # ===============================================================
+    # STEP 3 — Execute ONLY after approval
+    # ===============================================================
+
     execution = await execute_controlled_action(
         action_type
     )
 
+    # Never assume recovery before verification.
     recovered = False
-    snapshot = None
+
+    snapshot: dict | None = None
 
     if execution.get("ok"):
-        snapshot = await collect_full_diagnostics()
+
+        # Give the simulated service/action a moment
+        # to reach its new state if necessary.
+        snapshot = (
+            await collect_full_diagnostics()
+        )
+
         recovered = _service_recovered(
             snapshot,
             execution,
         )
 
+    # ===============================================================
+    # STEP 4 — Persist execution + verification
+    # ===============================================================
+
     with Session(engine) as session:
+
         approval = session.get(
             ApprovalRequest,
             approval_id,
@@ -368,6 +490,10 @@ async def _decide(
                 detail="Investigation record disappeared",
             )
 
+        # -----------------------------------------------------------
+        # Execution result
+        # -----------------------------------------------------------
+
         approval.execution_status = (
             "executed"
             if execution.get("ok")
@@ -378,16 +504,23 @@ async def _decide(
             execution
         )
 
-        investigation.stage = "VERIFYING"
-
-        investigation.status = (
-            "RECOVERED"
-            if recovered
-            else "FAILED"
-        )
+        # -----------------------------------------------------------
+        # Investigation status
+        # -----------------------------------------------------------
 
         if recovered:
+
             investigation.stage = "RECOVERED"
+            investigation.status = "RECOVERED"
+
+        else:
+
+            investigation.stage = "VERIFYING"
+            investigation.status = "FAILED"
+
+        # -----------------------------------------------------------
+        # Recovery verification
+        # -----------------------------------------------------------
 
         recovery_status = (
             snapshot.get("overall_status")
@@ -410,6 +543,10 @@ async def _decide(
             )
         )
 
+        # -----------------------------------------------------------
+        # Event — action executed
+        # -----------------------------------------------------------
+
         session.add(
             InvestigationEvent(
                 investigation_id=investigation_id,
@@ -422,6 +559,10 @@ async def _decide(
                 decision="executed_after_approval",
             )
         )
+
+        # -----------------------------------------------------------
+        # Event — recovery verification
+        # -----------------------------------------------------------
 
         session.add(
             InvestigationEvent(
@@ -437,29 +578,39 @@ async def _decide(
             )
         )
 
-        if investigation.incident_id and recovered:
+        # ===========================================================
+        # STEP 5 — Only recovered incident becomes HEALTHY
+        # ===========================================================
+
+        if (
+            investigation.incident_id
+            and recovered
+        ):
+
             incident = session.get(
                 Incident,
                 investigation.incident_id,
             )
 
             if incident is not None:
+
                 incident.status = "HEALTHY"
                 incident.severity = "LOW"
 
                 incident.reason = (
                     (incident.reason or "")
-                    + "\nRecovery verified after approved action."
+                    + "\n"
+                    "Recovery verified after "
+                    "approved action."
                 )
 
                 session.add(incident)
 
-        investigation.updated_at = datetime.now(
-            timezone.utc
-        )
+        investigation.updated_at = _now()
 
         session.add(approval)
         session.add(investigation)
+
         session.commit()
 
         session.refresh(investigation)
@@ -468,6 +619,10 @@ async def _decide(
             session,
             investigation,
         )
+
+    # ===============================================================
+    # STEP 6 — Metrics
+    # ===============================================================
 
     RECOVERY_RESULTS.labels(
         result=(

@@ -132,7 +132,11 @@ def health():
             status_code=503,
             content={"status": "unavailable", "service": "simulated-api-service", "scenario": scenario},
         )
-    if scenario in {"container_unhealthy", "container_restart_loop"}:
+    if scenario in {
+        "container_unhealthy", 
+        "container_restart_loop",
+        "combined_failure"
+        }:
         return JSONResponse(
             status_code=503,
             content={"status": "unhealthy", "service": "simulated-api-service", "scenario": scenario},
@@ -213,11 +217,23 @@ def internal_deployment():
 
 @app.post("/chaos/scenario")
 def set_scenario(payload: dict):
-    name = str(payload.get("scenario") or "")
+    name = str(
+        payload.get("name")
+        or payload.get("scenario")
+        or ""
+    ).strip()
+
     try:
         return apply_scenario(name)
+
     except ValueError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc), "allowed": sorted(SCENARIOS)})
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": str(exc),
+                "allowed": sorted(SCENARIOS),
+            },
+        )
 
 
 @app.post("/chaos/reset")
