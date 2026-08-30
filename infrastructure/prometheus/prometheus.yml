@@ -2,8 +2,15 @@ global:
   scrape_interval: 5s
 
 scrape_configs:
+
   - job_name: "operations-reliability-agent"
     metrics_path: "/metrics"
     static_configs:
       - targets:
-          - "host.docker.internal:8000"
+          - "api:8000"
+
+  - job_name: "simulated-api"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets:
+          - "simulated-api:8000"

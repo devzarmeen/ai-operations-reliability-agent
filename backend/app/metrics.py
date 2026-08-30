@@ -1,4 +1,4 @@
-from prometheus_client import Gauge
+from prometheus_client import Counter, Gauge
 
 
 # --------------------------------
@@ -46,6 +46,60 @@ SERVICE_HEALTH = Gauge(
     "reliability_service_health",
     "Current service health (1=healthy, 0=down)",
 )
+
+
+# --------------------------------
+# Agent observability
+# --------------------------------
+
+INVESTIGATIONS_STARTED = Counter(
+    "reliability_investigations_started_total",
+    "Investigations started by the reliability agent",
+)
+
+INVESTIGATIONS_COMPLETED = Counter(
+    "reliability_investigations_completed_total",
+    "Investigations completed by the reliability agent",
+    ["outcome"],
+)
+
+DIAGNOSTIC_TOOL_CALLS = Counter(
+    "reliability_diagnostic_tool_calls_total",
+    "Diagnostic tool invocations",
+    ["tool"],
+)
+
+DIAGNOSTIC_TOOL_FAILURES = Counter(
+    "reliability_diagnostic_tool_failures_total",
+    "Diagnostic tool failures",
+    ["tool"],
+)
+
+APPROVAL_REQUESTS = Counter(
+    "reliability_approval_requests_total",
+    "High-impact approval requests created",
+    ["action"],
+)
+
+APPROVAL_DECISIONS = Counter(
+    "reliability_approval_decisions_total",
+    "Human approval decisions",
+    ["decision"],
+)
+
+RECOVERY_RESULTS = Counter(
+    "reliability_recovery_results_total",
+    "Recovery verification outcomes",
+    ["result"],
+)
+
+
+def record_tool_call(tool: str) -> None:
+    DIAGNOSTIC_TOOL_CALLS.labels(tool=tool).inc()
+
+
+def record_tool_failure(tool: str) -> None:
+    DIAGNOSTIC_TOOL_FAILURES.labels(tool=tool).inc()
 
 
 def update_reliability_metrics(

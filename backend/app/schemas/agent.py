@@ -18,3 +18,8 @@ class AgentResponse(BaseModel):
     evidence: ReliabilityEvidence
     diagnosis: str
     recommended_action: str
+    investigation_id: int | None = None
+    likely_cause: str | None = None
+    confidence: float | None = None
+    approval_required: bool | None = None
+    approval_status: str | None = None

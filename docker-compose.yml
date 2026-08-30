@@ -8,20 +8,40 @@ services:
     container_name: reliability-api
 
     ports:
-      - "9000:8001"
+      - "9000:8000"
 
     depends_on:
       postgres:
         condition: service_healthy
+      simulated-api:
+        condition: service_started
 
     environment:
       DATABASE_URL: postgresql://reliability_user:reliability_password@postgres:5432/reliability_agent
       GROQ_API_KEY: ${GROQ_API_KEY}
+      PROMETHEUS_URL: http://prometheus:9090
+      SIMULATED_API_URL: http://simulated-api:8000
 
+    volumes:
+      - ./evaluation:/evaluation:ro
+
+  simulated-api:
+    build:
+      context: ./simulated-api
+      dockerfile: Dockerfile
+
+    container_name: simulated-api
+
+    ports:
+      - "8001:8000"
 
   prometheus:
     image: prom/prometheus:latest
     container_name: reliability-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-admin-api'
 
     ports:
       - "9090:9090"

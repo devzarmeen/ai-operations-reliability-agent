@@ -1,18 +1,9 @@
 from fastapi import APIRouter
 from sqlmodel import Session
 
-from agents import Runner
-
-from app.agent.reliability_agent import reliability_agent
+from app.agent.investigation import run_investigation
 from app.core.database import engine
-
-from app.diagnostics.health import service_health
-from app.diagnostics.metrics import request_metrics
-from app.diagnostics.errors import error_rate
-from app.diagnostics.latency import latency
-
 from app.models.incident import Incident
-
 from app.schemas.agent import (
     AgentRequest,
     AgentResponse,
@@ -26,123 +17,21 @@ router = APIRouter(
 )
 
 
-@router.post("/analyze", response_model=AgentResponse)
+@router.post(
+    "/analyze",
+    response_model=AgentResponse,
+)
 async def analyze(request: AgentRequest):
 
-    # -----------------------------------------
-    # 1. Collect diagnostic evidence
-    # -----------------------------------------
-
-    health = await service_health(
-        service_name="simulated-api-service"
-    )
-
-    metrics = await request_metrics(
-        metric_name="api_request_rate"
-    )
-
-    errors = await error_rate(
-        metric_name="5xx_error_rate"
-    )
-
-    latency_result = await latency(
-        metric_name="p95_request_latency"
-    )
-
-    # -----------------------------------------
-    # 2. Build evidence for AI agent
-    # -----------------------------------------
-
-    evidence_prompt = f"""
-User request:
-{request.query}
-
-Current production reliability evidence:
-
-Service Health:
-{health}
-
-Request Rate:
-{metrics}
-
-5xx Error Rate:
-{errors}
-
-P95 Latency:
-{latency_result}
-
-Analyze the service using ONLY the diagnostic evidence above.
-
-Determine whether the service is:
-- HEALTHY
-- DEGRADED
-- DOWN
-
-Do not say UNKNOWN when the supplied evidence is sufficient.
-Do not invent any metrics.
-"""
-
-    # -----------------------------------------
-    # 3. Run AI Reliability Agent
-    # -----------------------------------------
-
-    result = await Runner.run(
-        reliability_agent,
-        evidence_prompt,
-    )
-
-    # -----------------------------------------
-    # 4. Determine API status
-    # -----------------------------------------
-
-    is_healthy = health.get("healthy", False)
-
-    if not is_healthy:
-        status = "DOWN"
-        severity = "CRITICAL"
-
-    elif errors.get("error_rate", 0) > 5:
-        status = "DEGRADED"
-        severity = "HIGH"
-
-    elif latency_result.get("value", 0) > 0.100:
-        status = "DEGRADED"
-        severity = "MEDIUM"
-
-    else:
-        status = "HEALTHY"
-        severity = "LOW"
-
-    # -----------------------------------------
-    # 5. Recommended action
-    # -----------------------------------------
-
-    if status == "HEALTHY":
-        recommended_action = "Continue normal monitoring."
-
-    elif status == "DEGRADED":
-        recommended_action = (
-            "Investigate elevated reliability metrics "
-            "and continue monitoring."
-        )
-
-    else:
-        recommended_action = (
-            "Investigate the production service immediately."
-        )
-
-    # -----------------------------------------
-    # 6. Save incident
-    # -----------------------------------------
+    # ---------------------------------------------------------
+    # 1. Create incident
+    # ---------------------------------------------------------
 
     incident = Incident(
-        status=status,
-        severity=severity,
-        reason=result.final_output,
+        status="INVESTIGATING",
+        severity="MEDIUM",
+        reason=request.query,
         service_name="simulated-api-service",
-        request_rate=metrics.get("value"),
-        error_rate=errors.get("error_rate"),
-        p95_latency_seconds=latency_result.get("value"),
     )
 
     with Session(engine) as session:
@@ -150,22 +39,68 @@ Do not invent any metrics.
         session.commit()
         session.refresh(incident)
 
-    # -----------------------------------------
-    # 7. Return API response
-    # -----------------------------------------
+        incident_id = incident.id
+
+    # ---------------------------------------------------------
+    # 2. Start investigation
+    # ---------------------------------------------------------
+
+    investigation = await run_investigation(
+        alert={
+            "alert_id": f"agent-analyze-{incident_id}",
+            "alert_name": "manual-analyze",
+            "status": "firing",
+            "severity": "medium",
+            "service_name": "simulated-api-service",
+            "summary": request.query,
+            "reason": request.query,
+        },
+        incident_id=incident_id,
+    )
+
+    # ---------------------------------------------------------
+    # 3. Build evidence response from investigation events
+    # ---------------------------------------------------------
+
+    evidence = ReliabilityEvidence(
+        health=None,
+        request_rate=None,
+        error_rate=None,
+        p95_latency_seconds=None,
+    )
+
+    recommended_action = (
+        investigation.recommended_action
+        or "Continue normal monitoring."
+    )
+
+    if investigation.approval_required:
+        recommended_action = (
+            f"{recommended_action} "
+            "BLOCKED until explicit human approval."
+        )
+
+    # ---------------------------------------------------------
+    # 4. Return unified agent response
+    # ---------------------------------------------------------
 
     return AgentResponse(
-        status=status,
-        severity=severity,
-
-        evidence=ReliabilityEvidence(
-            health=is_healthy,
-            request_rate=metrics.get("value"),
-            error_rate=errors.get("error_rate"),
-            p95_latency_seconds=latency_result.get("value"),
+        status=(
+            "AWAITING_APPROVAL"
+            if investigation.approval_required
+            else investigation.status
         ),
-
-        diagnosis=result.final_output,
-
+        severity="MEDIUM",
+        evidence=evidence,
+        diagnosis=(
+            investigation.diagnosis
+            or investigation.likely_cause
+            or ""
+        ),
         recommended_action=recommended_action,
+        investigation_id=investigation.id,
+        likely_cause=investigation.likely_cause,
+        confidence=investigation.confidence,
+        approval_required=investigation.approval_required,
+        approval_status=investigation.approval_status,
     )

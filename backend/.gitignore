@@ -1,29 +1,49 @@
-# =========================
+# ============================================================
+# Operations Reliability Agent
+# Git Ignore Rules
+# ============================================================
+
+
+# ============================================================
 # Environment / Secrets
-# =========================
+# ============================================================
+
 .env
 .env.*
 !.env.example
 
 backend/.env
 backend/.env.*
+!backend/.env.example
+
 agent/.env
 agent/.env.*
+!agent/.env.example
 
-# API keys / credentials
+# API keys / credentials / certificates
 *.key
 *.pem
 *.crt
 *.p12
 *.pfx
+*.jks
+
 credentials.json
 secrets.json
 service-account*.json
 
-# =========================
-# Backups
-# =========================
+# Private configuration
+secrets/
+credentials/
+config/secrets/
+
+
+# ============================================================
+# Backups / Database Dumps
+# ============================================================
+
 backups/
+
 *.sql
 *.dump
 *.backup
@@ -32,73 +52,184 @@ backups/
 *.tar.gz
 *.zip
 
-# =========================
+
+# ============================================================
 # Python
-# =========================
+# ============================================================
+
 __pycache__/
 *.py[cod]
 *.pyo
+*$py.class
+
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pyre/
+.hypothesis/
+
 .coverage
+.coverage.*
 htmlcov/
+
 .venv/
 venv/
 env/
+ENV/
 
-# =========================
-# Node
-# =========================
+*.egg-info/
+.eggs/
+build/
+dist/
+
+
+# ============================================================
+# Python Tools / Local Development
+# ============================================================
+
+.pyright/
+.pyre/
+pip-wheel-metadata/
+
+.pytest_cache/
+.coverage
+
+
+# ============================================================
+# Node / Frontend
+# ============================================================
+
 node_modules/
 dist/
 build/
 .npm/
 .cache/
 
-# =========================
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+
+# ============================================================
 # IDE / Editor
-# =========================
+# ============================================================
+
 .vscode/
 .idea/
+
 *.swp
 *.swo
+*.swn
 
-# =========================
+*.code-workspace
+
+
+# ============================================================
 # Logs
-# =========================
+# ============================================================
+
 *.log
 logs/
 
-# =========================
-# OS
-# =========================
+
+# ============================================================
+# OS Generated Files
+# ============================================================
+
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# =========================
-# Temporary files
-# =========================
+
+# ============================================================
+# Temporary / Generated Files
+# ============================================================
+
 *.tmp
 *.temp
-*.bak
 *.orig
+*.rej
 
-# =========================
-# Local databases
-# =========================
+tmp/
+temp/
+
+
+# ============================================================
+# Local Databases
+# ============================================================
+
 *.db
 *.sqlite
 *.sqlite3
 
-# =========================
-# Grafana / Prometheus local data
-# =========================
+
+# ============================================================
+# Docker Local Data
+# ============================================================
+
+docker-data/
+postgres-data/
+prometheus-data/
+grafana-data/
+
+.docker/
+
+
+# ============================================================
+# Prometheus / Grafana Backups
+# ============================================================
+
 grafana-backup.tar.gz
 prometheus-backup.tar.gz
 
-# =========================
-# Local Docker data
-# =========================
-docker-data/
+grafana-backup/
+prometheus-backup/
+
+
+# ============================================================
+# Local Runtime / Generated Artifacts
+# ============================================================
+
+runtime/
+local-data/
+data/local/
+
+*.pid
+*.pid.lock
+
+
+# ============================================================
+# Generated Test / Evaluation Artifacts
+# ============================================================
+
+test-results/
+test-output/
+evaluation-results/
+coverage/
+
+
+# ============================================================
+# Local Documentation Artifacts
+# ============================================================
+
+# Keep professional project documentation tracked.
+# Only ignore private/local documentation artifacts.
+
+docs/.private/
+docs/.local/
+docs/private/
+docs/drafts/
+docs/*-private.md
+
+
+# ============================================================
+# Secrets accidentally stored in documentation
+# ============================================================
+
+*.secret
+*.secrets
+
+# Local notes that may contain credentials/configuration
+NOTES_PRIVATE.md
+LOCAL_SETUP.md
+PRIVATE_NOTES.md

@@ -12,6 +12,7 @@ from app.diagnostics.latency import latency
 from app.models.incident import Incident
 from app.alerts.manager import handle_incident_alert
 from app.metrics import update_reliability_metrics
+from app.agent.investigation import run_investigation
 
 async def run_reliability_check():
     """
@@ -63,24 +64,34 @@ Do not invent any metrics.
 Do not say UNKNOWN when the supplied evidence is sufficient.
 """
 
-    # 3. Run AI reliability agent
-    result = await Runner.run(
-        reliability_agent,
-        evidence_prompt,
-    )
+    # 3. Run AI reliability agent (fail safe if the model is unavailable)
+    try:
+        result = await Runner.run(
+            reliability_agent,
+            evidence_prompt,
+        )
+        diagnosis_text = result.final_output
+    except Exception as exc:  # noqa: BLE001
+        print(f"[SCHEDULER] Reliability agent unavailable: {exc}")
+        diagnosis_text = (
+            "Deterministic status from diagnostic evidence; "
+            "LLM diagnosis unavailable."
+        )
 
     # 4. Determine status and severity
     is_healthy = health.get("healthy", False)
+    current_error_rate = errors.get("error_rate") or 0
+    current_latency = latency_result.get("value") or 0
 
     if not is_healthy:
         status = "DOWN"
         severity = "CRITICAL"
 
-    elif errors.get("error_rate", 0) > 5:
+    elif current_error_rate > 5:
         status = "DEGRADED"
         severity = "HIGH"
 
-    elif latency_result.get("value", 0) > 0.100:
+    elif current_latency > 0.100:
         status = "DEGRADED"
         severity = "MEDIUM"
 
@@ -102,7 +113,7 @@ Do not say UNKNOWN when the supplied evidence is sufficient.
     incident = Incident(
         status=status,
         severity=severity,
-        reason=result.final_output,
+        reason=diagnosis_text,
         service_name="simulated-api-service",
         request_rate=metrics.get("value"),
         error_rate=errors.get("error_rate"),
@@ -164,7 +175,21 @@ Do not say UNKNOWN when the supplied evidence is sufficient.
     )
 
     if state_changed:
-        await handle_incident_alert(incident)
+        investigation = None
+        if incident.status in {"DEGRADED", "DOWN"}:
+            investigation = await run_investigation(
+                alert={
+                    "alert_id": f"scheduler-{incident.id}",
+                    "alert_name": f"scheduler-{incident.status}",
+                    "status": incident.status,
+                    "severity": incident.severity,
+                    "service_name": incident.service_name,
+                    "summary": incident.reason,
+                    "reason": incident.reason,
+                },
+                incident_id=incident.id,
+            )
+        await handle_incident_alert(incident, investigation=investigation)
     else:
         print(
             f"[ALERT] Duplicate state detected: "

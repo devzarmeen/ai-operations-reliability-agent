@@ -106,7 +106,7 @@ Reason:
         )
 
 
-async def send_slack_alert(incident: Incident):
+async def send_slack_alert(incident: Incident, investigation=None):
     """
     Send a Slack alert for a reliability incident or recovery event.
     """
@@ -132,6 +132,17 @@ async def send_slack_alert(incident: Incident):
         title = "Operations Reliability Alert"
         message_line = "Please investigate the service."
 
+    extra = ""
+    if investigation is not None:
+        extra = (
+            f"\n*Investigation:* #{investigation.id}\n"
+            f"*Likely cause:* {investigation.likely_cause}\n"
+            f"*Confidence:* {investigation.confidence}\n"
+            f"*Recommended action:* {investigation.recommended_action}\n"
+            f"*Approval required:* {investigation.approval_required}\n"
+            f"*Approval status:* {investigation.approval_status}\n"
+        )
+
     message = {
         "text": (
             f"{icon} *{title}*\n\n"
@@ -143,7 +154,8 @@ async def send_slack_alert(incident: Incident):
             f"*5xx Error Rate:* {incident.error_rate}%\n"
             f"*P95 Latency:* {incident.p95_latency_seconds}s\n\n"
             f"*Reason:*\n"
-            f"{incident.reason}\n\n"
+            f"{incident.reason}\n"
+            f"{extra}\n"
             f"{message_line}"
         )
     }
@@ -173,7 +185,7 @@ async def send_slack_alert(incident: Incident):
         )
 
 
-async def handle_incident_alert(incident: Incident):
+async def handle_incident_alert(incident: Incident, investigation=None):
     """
     Handle external alerts for reliability incidents
     and recovery events.
@@ -190,4 +202,4 @@ async def handle_incident_alert(incident: Incident):
     )
 
     await send_email_alert(incident)
-    await send_slack_alert(incident)
+    await send_slack_alert(incident, investigation=investigation)
