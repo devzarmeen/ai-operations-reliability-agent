@@ -88,11 +88,7 @@ dist/
 # ============================================================
 
 .pyright/
-.pyre/
 pip-wheel-metadata/
-
-.pytest_cache/
-.coverage
 
 
 # ============================================================
@@ -212,9 +208,6 @@ coverage/
 # Local Documentation Artifacts
 # ============================================================
 
-# Keep professional project documentation tracked.
-# Only ignore private/local documentation artifacts.
-
 docs/.private/
 docs/.local/
 docs/private/
@@ -229,7 +222,6 @@ docs/*-private.md
 *.secret
 *.secrets
 
-# Local notes that may contain credentials/configuration
 NOTES_PRIVATE.md
 LOCAL_SETUP.md
 PRIVATE_NOTES.md

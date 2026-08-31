@@ -21,11 +21,11 @@ from app.safety.enforcement import requires_approval
 from app.services.diagnostics import (
     collect_container_health,
     collect_database_signals,
+    collect_deployments,
     collect_full_diagnostics,
     collect_logs,
     collect_prometheus_snapshot,
     collect_service_health,
-    collect_deployments,
 )
 
 
@@ -114,7 +114,15 @@ def select_tools(alert: dict[str, Any]) -> list[str]:
     Select diagnostic tools based on alert content.
 
     Service health and Prometheus metrics are always collected.
-    Additional tools are selected according to the alert.
+
+    Client-error alerts such as:
+        400
+        4xx
+        client errors
+        HTTP 400
+
+    also collect structured logs so the agent can verify the
+    signal before making a recommendation.
     """
 
     text = " ".join(
@@ -133,12 +141,20 @@ def select_tools(alert: dict[str, Any]) -> list[str]:
         "prometheus_metrics",
     ]
 
+    # --------------------------------------------------------
+    # Server/application errors
+    # --------------------------------------------------------
+
     if any(
         token in text
         for token in (
             "error",
             "5xx",
             "500",
+            "4xx",
+            "400",
+            "client error",
+            "client errors",
             "exception",
             "degraded",
         )
@@ -150,6 +166,10 @@ def select_tools(alert: dict[str, Any]) -> list[str]:
                 "container_health",
             ]
         )
+
+    # --------------------------------------------------------
+    # Latency
+    # --------------------------------------------------------
 
     if any(
         token in text
@@ -166,6 +186,10 @@ def select_tools(alert: dict[str, Any]) -> list[str]:
             ]
         )
 
+    # --------------------------------------------------------
+    # Service availability / health
+    # --------------------------------------------------------
+
     if any(
         token in text
         for token in (
@@ -181,6 +205,10 @@ def select_tools(alert: dict[str, Any]) -> list[str]:
             ]
         )
 
+    # --------------------------------------------------------
+    # Deployment
+    # --------------------------------------------------------
+
     if any(
         token in text
         for token in (
@@ -190,6 +218,10 @@ def select_tools(alert: dict[str, Any]) -> list[str]:
         )
     ):
         tools.append("deployments")
+
+    # --------------------------------------------------------
+    # Database
+    # --------------------------------------------------------
 
     if any(
         token in text
@@ -201,10 +233,17 @@ def select_tools(alert: dict[str, Any]) -> list[str]:
     ):
         tools.append("database_signals")
 
+    # --------------------------------------------------------
+    # Explicit logs
+    # --------------------------------------------------------
+
     if "log" in text:
         tools.append("structured_logs")
 
-    # Preserve order and remove duplicates.
+    # --------------------------------------------------------
+    # Preserve order and remove duplicates
+    # --------------------------------------------------------
+
     ordered: list[str] = []
 
     for tool in tools:
@@ -279,12 +318,9 @@ def _extract_signals(
     Missing evidence is represented as None.
     Missing evidence is NEVER converted into False.
 
-    Additional evidence flags are returned so hypothesis
-    testing can distinguish:
-
-        False = actual negative evidence
-        None  = evidence unavailable
-        True  = actual positive evidence
+    False = actual negative evidence
+    None  = evidence unavailable
+    True  = actual positive evidence
     """
 
     # --------------------------------------------------------
@@ -395,9 +431,10 @@ def _extract_signals(
     if not isinstance(simulated_db, dict):
         simulated_db = {}
 
-    postgres = database.get(
-        "reliability_postgres"
-    ) or {}
+    postgres = (
+        database.get("reliability_postgres")
+        or {}
+    )
 
     if not isinstance(postgres, dict):
         postgres = {}
@@ -458,6 +495,29 @@ def _extract_signals(
                 item.get("message", "")
             ).lower()
             or "500"
+            in str(
+                item.get("message", "")
+            ).lower()
+        )
+        for item in repeated_errors
+        if isinstance(item, dict)
+    )
+
+    # --------------------------------------------------------
+    # Client-error log evidence
+    # --------------------------------------------------------
+
+    log_client_error_evidence = any(
+        (
+            "4xx"
+            in str(
+                item.get("message", "")
+            ).lower()
+            or "400"
+            in str(
+                item.get("message", "")
+            ).lower()
+            or "client error"
             in str(
                 item.get("message", "")
             ).lower()
@@ -585,9 +645,8 @@ def _extract_signals(
         "p95": p95,
         "request_rate": request_rate,
 
-        # IMPORTANT:
-        # None = evidence unavailable.
         "health_ok": health_ok,
+
         "health_evidence_available": (
             health_evidence_available
         ),
@@ -672,6 +731,10 @@ def _extract_signals(
         "log_5xx_evidence": (
             log_5xx_evidence
         ),
+
+        "log_client_error_evidence": (
+            log_client_error_evidence
+        ),
     }
 
 
@@ -696,7 +759,7 @@ def _test_hypothesis(
 
     client_error_rate = _num(
         signals.get("client_error_rate")
-    ) or 0.0
+    )
 
     p95 = _num(
         signals.get("p95")
@@ -764,6 +827,16 @@ def _test_hypothesis(
         health_evidence_available
         and health_ok is False
         and not container_failure
+    )
+
+    # --------------------------------------------------------
+    # Client error evidence
+    # --------------------------------------------------------
+
+    client_errors_supported = (
+        client_error_rate is not None
+        and client_error_rate > 5.0
+        and error_rate <= 5.0
     )
 
     tests = {
@@ -850,8 +923,7 @@ def _test_hypothesis(
         # ----------------------------------------------------
 
         "client_errors": (
-            client_error_rate > 15
-            and error_rate <= 5
+            client_errors_supported
         ),
 
         # ----------------------------------------------------
@@ -886,14 +958,14 @@ def _test_hypothesis(
         # False positive
         # ----------------------------------------------------
 
-        # IMPORTANT:
-        # Missing health evidence cannot be treated as
-        # healthy.
         "false_positive": (
             health_evidence_available
             and health_ok is True
             and error_rate <= 1
-            and client_error_rate <= 5
+            and (
+                client_error_rate is None
+                or client_error_rate <= 5
+            )
             and p95 <= 0.1
         ),
 
@@ -949,7 +1021,7 @@ def _candidate_order(
 
     client_error_rate = _num(
         signals.get("client_error_rate")
-    ) or 0.0
+    )
 
     p95 = _num(
         signals.get("p95")
@@ -1096,9 +1168,6 @@ def _candidate_order(
     # 5. Service unavailable
     # --------------------------------------------------------
 
-    # IMPORTANT:
-    # Do not infer service_unavailable merely because
-    # health data is missing.
     if (
         health_evidence_available
         and health_ok is False
@@ -1140,10 +1209,16 @@ def _candidate_order(
 
     # --------------------------------------------------------
     # 8. Client errors
+    #
+    # IMPORTANT:
+    # This is BEFORE false_positive.
+    # 400/4xx spikes with low 5xx are classified
+    # as client_errors.
     # --------------------------------------------------------
 
     if (
-        client_error_rate > 15
+        client_error_rate is not None
+        and client_error_rate > 5
         and error_rate <= 5
     ):
         ordered.append(
@@ -1226,6 +1301,29 @@ def _candidate_order(
             "application_errors"
         )
 
+    # --------------------------------------------------------
+    # Client-error alert-text hint
+    # --------------------------------------------------------
+
+    if any(
+        token in text
+        for token in (
+            "400",
+            "4xx",
+            "client error",
+            "client errors",
+            "bad request",
+        )
+    ):
+        if (
+            client_error_rate is not None
+            and client_error_rate > 5
+            and error_rate <= 5
+        ):
+            ordered.append(
+                "client_errors"
+            )
+
     if any(
         token in text
         for token in (
@@ -1245,10 +1343,6 @@ def _candidate_order(
             "unavailable",
         )
     ):
-        # Alert text alone must NOT create
-        # service_unavailable.
-        #
-        # Actual health evidence is required.
         if (
             health_evidence_available
             and health_ok is False
@@ -1331,8 +1425,19 @@ def _calculate_confidence(
     ):
         evidence_count += 1
 
+    if signals.get(
+        "log_client_error_evidence"
+    ):
+        evidence_count += 1
+
     if (
         signals.get("error_rate")
+        is not None
+    ):
+        evidence_count += 1
+
+    if (
+        signals.get("client_error_rate")
         is not None
     ):
         evidence_count += 1
@@ -1359,8 +1464,6 @@ def _calculate_confidence(
     if evidence_count >= 2:
         return 0.78
 
-    # One actual piece of evidence is still usable,
-    # but confidence must be lower.
     if evidence_count == 1:
         return 0.70
 
@@ -1773,6 +1876,11 @@ async def run_investigation(
         or 0
     )
 
+    client_error_rate = (
+        signals.get("client_error_rate")
+        or 0
+    )
+
     health_ok = signals.get(
         "health_ok"
     )
@@ -1782,7 +1890,10 @@ async def run_investigation(
         or 0
     )
 
-    # Error or confirmed unhealthy service.
+    # --------------------------------------------------------
+    # Server errors / confirmed unhealthy service
+    # --------------------------------------------------------
+
     if (
         error_rate > 1
         or health_ok is False
@@ -1796,7 +1907,24 @@ async def run_investigation(
             ]
         )
 
-    # Latency degradation.
+    # --------------------------------------------------------
+    # Client-error degradation
+    #
+    # IMPORTANT:
+    # 400/4xx spikes require log verification.
+    # --------------------------------------------------------
+
+    if client_error_rate > 5:
+        follow_up.extend(
+            [
+                "structured_logs",
+            ]
+        )
+
+    # --------------------------------------------------------
+    # Latency degradation
+    # --------------------------------------------------------
+
     if p95 > 0.1:
         follow_up.extend(
             [
@@ -1954,6 +2082,7 @@ async def run_investigation(
         f"Health evidence="
         f"{signals.get('health_evidence_available')}, "
         f"5xx={signals.get('error_rate')}, "
+        f"4xx={signals.get('client_error_rate')}, "
         f"p95={signals.get('p95')}, "
         f"request_rate="
         f"{signals.get('request_rate')}, "

@@ -184,8 +184,12 @@ async def collect_prometheus_snapshot() -> dict[str, Any]:
     record_tool_call(tool_name)
 
     queries = {
+        # Existing metrics
         "error_rate_percent": (
             "reliability_error_rate"
+        ),
+        "client_error_rate_percent": (
+            "reliability_client_error_rate"
         ),
         "p95_latency_seconds": (
             "reliability_p95_latency_seconds"
@@ -210,18 +214,17 @@ async def collect_prometheus_snapshot() -> dict[str, Any]:
 
             if result.get("ok"):
 
-                metrics[name] = result.get(
-                    "value"
-                )
+                value = result.get("value")
 
-                # Prometheus successfully answered,
-                # but the query may have no series.
-                if result.get("value") is None:
+                metrics[name] = value
+
+                if value is None:
                     query_errors[name] = (
                         "metric returned no numeric value"
                     )
 
             else:
+
                 metrics[name] = None
 
                 query_errors[name] = (
@@ -232,7 +235,6 @@ async def collect_prometheus_snapshot() -> dict[str, Any]:
         except Exception as exc:
 
             metrics[name] = None
-
             query_errors[name] = str(exc)
 
     usable_metrics = {
@@ -265,13 +267,20 @@ async def collect_prometheus_snapshot() -> dict[str, Any]:
     )
 
     if health_value is None:
+
         overall_status = "UNKNOWN"
 
     elif float(health_value) >= 1:
+
         overall_status = "HEALTHY"
 
     else:
+
         overall_status = "UNHEALTHY"
+
+    # ---------------------------------------------------------------
+    # Return ONE canonical result.
+    # ---------------------------------------------------------------
 
     return _success(
         tool_name,
@@ -283,16 +292,22 @@ async def collect_prometheus_snapshot() -> dict[str, Any]:
             "metrics": metrics,
 
             # Compatibility fields
-            # used by investigation.py
             "error_rate_percent": metrics.get(
                 "error_rate_percent"
             ),
+
+            "client_error_rate_percent": metrics.get(
+                "client_error_rate_percent"
+            ),
+
             "p95_latency_seconds": metrics.get(
                 "p95_latency_seconds"
             ),
+
             "request_rate_per_second": metrics.get(
                 "request_rate_per_second"
             ),
+
             "service_health": metrics.get(
                 "service_health"
             ),
@@ -382,9 +397,8 @@ async def collect_database_signals() -> dict[str, Any]:
     )
 
     try:
-        select_result = (
-            test_database_connection()
-        )
+
+        select_result = test_database_connection()
 
         postgres = {
             "available": True,
